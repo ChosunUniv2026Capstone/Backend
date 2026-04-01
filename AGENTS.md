@@ -29,8 +29,10 @@
 이 경우 `$spec-first-dev-guard` 절차를 따른다.
 
 ## Git 규칙
-- 브랜치: `feat/backend/<slug>` 등
+- 브랜치: `feat/<slug>` 등
 - 커밋: `<type>(backend): <subject>`
+- `main` 에서 직접 commit 하지 않는다. bootstrap 이 설치한 shared hook 이 이를 차단한다.
+- 기능 시작은 `./start_feature.sh <slug>` 또는 `./start_feature.sh --worktree <slug>` 를 우선 사용한다.
 - API / auth / attendance / schema 변경은 docs-first
 - presence-service 역할을 backend 안에 복제하지 않는다.
 
