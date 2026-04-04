@@ -213,6 +213,13 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
     ]
 
 
+def get_notice_detail(db: Session, login_id: str, notice_id: int) -> dict:
+    notice = next((item for item in list_notices(db, login_id) if item["id"] == notice_id), None)
+    if not notice:
+        raise HTTPException(status_code=404, detail="notice not found")
+    return notice
+
+
 def create_notice(db: Session, professor_id: str, title: str, body: str, course_code: str | None) -> Notice:
     professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
     if not professor:

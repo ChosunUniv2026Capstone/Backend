@@ -28,6 +28,7 @@ from app.services import (
     create_device,
     delete_device,
     get_user_login_id,
+    get_notice_detail,
     list_classroom_networks,
     list_classrooms,
     list_notices,
@@ -84,6 +85,11 @@ def get_professor_courses(professor_id: str, db: Session = Depends(get_db)) -> l
 @app.get("/api/notices/{login_id}", response_model=list[NoticeRead])
 def get_notices(login_id: str, db: Session = Depends(get_db)) -> list[NoticeRead]:
     return [NoticeRead(**notice) for notice in list_notices(db, login_id)]
+
+
+@app.get("/api/notices/{login_id}/{notice_id}", response_model=NoticeRead)
+def get_notice(login_id: str, notice_id: int, db: Session = Depends(get_db)) -> NoticeRead:
+    return NoticeRead(**get_notice_detail(db, login_id, notice_id))
 
 
 @app.post("/api/professors/{professor_id}/notices", response_model=NoticeRead, status_code=status.HTTP_201_CREATED)
