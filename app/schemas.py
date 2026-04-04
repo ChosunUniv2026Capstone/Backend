@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import ConfigDict
 from pydantic import BaseModel, Field
@@ -46,6 +47,20 @@ class NoticeRead(BaseModel):
     course_code: str | None = None
     author_name: str
     created_at: datetime | None = None
+
+
+class NoticeListResponse(BaseModel):
+    success: Literal[True] = True
+    data: list[NoticeRead]
+    message: str = "ok"
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class NoticeResponse(BaseModel):
+    success: Literal[True] = True
+    data: NoticeRead
+    message: str = "ok"
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class UserSummary(BaseModel):

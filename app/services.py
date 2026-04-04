@@ -198,6 +198,15 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
         )
     elif user.role == "professor":
         stmt = stmt.where(Notice.author_user_id == user.id)
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "notice access is not available for this role",
+                "details": {"role": user.role},
+            },
+        )
 
     rows = db.execute(stmt)
     return [
@@ -213,10 +222,31 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
     ]
 
 
+def get_notice_detail(db: Session, login_id: str, notice_id: int) -> dict:
+    notice = next((item for item in list_notices(db, login_id) if item["id"] == notice_id), None)
+    if not notice:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "NOTICE_NOT_FOUND",
+                "message": "notice not found",
+                "details": {"notice_id": notice_id},
+            },
+        )
+    return notice
+
+
 def create_notice(db: Session, professor_id: str, title: str, body: str, course_code: str | None) -> Notice:
     professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
     if not professor:
-        raise HTTPException(status_code=404, detail="professor not found")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "PROFESSOR_NOT_FOUND",
+                "message": "professor not found",
+                "details": {"professor_id": professor_id},
+            },
+        )
 
     course_id = None
     if course_code:
@@ -224,7 +254,14 @@ def create_notice(db: Session, professor_id: str, title: str, body: str, course_
             select(Course).where(Course.course_code == course_code, Course.professor_user_id == professor.id)
         )
         if not course:
-            raise HTTPException(status_code=404, detail="course not found")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "COURSE_NOT_FOUND",
+                    "message": "course not found",
+                    "details": {"course_code": course_code},
+                },
+            )
         course_id = course.id
 
     notice = Notice(author_user_id=professor.id, course_id=course_id, title=title.strip(), body=body.strip())
