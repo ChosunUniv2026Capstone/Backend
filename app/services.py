@@ -198,6 +198,15 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
         )
     elif user.role == "professor":
         stmt = stmt.where(Notice.author_user_id == user.id)
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "notice access is not available for this role",
+                "details": {"role": user.role},
+            },
+        )
 
     rows = db.execute(stmt)
     return [

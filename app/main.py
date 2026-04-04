@@ -1,4 +1,4 @@
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -54,15 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DEFAULT_ERROR_CODE_BY_STATUS = {
-    status.HTTP_400_BAD_REQUEST: "BAD_REQUEST",
-    status.HTTP_401_UNAUTHORIZED: "UNAUTHENTICATED",
-    status.HTTP_403_FORBIDDEN: "FORBIDDEN",
-    status.HTTP_404_NOT_FOUND: "NOT_FOUND",
-    status.HTTP_409_CONFLICT: "CONFLICT",
-}
-
-
 def api_error(status_code: int, code: str, message: str, details: dict | None = None) -> HTTPException:
     return HTTPException(
         status_code=status_code,
@@ -74,26 +65,17 @@ def api_error(status_code: int, code: str, message: str, details: dict | None = 
     )
 
 
-@app.exception_handler(HTTPException)
-def handle_http_exception(_request: Request, exc: HTTPException) -> JSONResponse:
-    detail = exc.detail
-    if isinstance(detail, dict) and "code" in detail and "message" in detail:
-        error = {
-            "code": detail["code"],
-            "message": detail["message"],
-            "details": detail.get("details", {}),
-        }
-    else:
-        error = {
-            "code": DEFAULT_ERROR_CODE_BY_STATUS.get(exc.status_code, "HTTP_ERROR"),
-            "message": detail if isinstance(detail, str) else "request failed",
-            "details": {},
-        }
+def notice_error_response(exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
-            "error": error,
+            "error": {
+                "code": detail.get("code", "NOTICE_REQUEST_FAILED"),
+                "message": detail.get("message", "notice request failed"),
+                "details": detail.get("details", {}),
+            },
         },
     )
 
@@ -169,10 +151,13 @@ def get_notices(
     login_id: str,
     authenticated_login_id: str = Depends(require_authenticated_login_id),
     db: Session = Depends(get_db),
-) -> NoticeListResponse:
-    ensure_path_user_matches(authenticated_login_id, login_id)
-    notices = [NoticeRead(**notice) for notice in list_notices(db, login_id)]
-    return NoticeListResponse(data=notices, meta={"login_id": login_id, "count": len(notices)})
+) -> NoticeListResponse | JSONResponse:
+    try:
+        ensure_path_user_matches(authenticated_login_id, login_id)
+        notices = [NoticeRead(**notice) for notice in list_notices(db, login_id)]
+        return NoticeListResponse(data=notices, meta={"login_id": login_id, "count": len(notices)})
+    except HTTPException as exc:
+        return notice_error_response(exc)
 
 
 @app.get("/api/notices/{login_id}/{notice_id}", response_model=NoticeResponse)
@@ -181,10 +166,13 @@ def get_notice(
     notice_id: int,
     authenticated_login_id: str = Depends(require_authenticated_login_id),
     db: Session = Depends(get_db),
-) -> NoticeResponse:
-    ensure_path_user_matches(authenticated_login_id, login_id)
-    notice = NoticeRead(**get_notice_detail(db, login_id, notice_id))
-    return NoticeResponse(data=notice, meta={"login_id": login_id})
+) -> NoticeResponse | JSONResponse:
+    try:
+        ensure_path_user_matches(authenticated_login_id, login_id)
+        notice = NoticeRead(**get_notice_detail(db, login_id, notice_id))
+        return NoticeResponse(data=notice, meta={"login_id": login_id})
+    except HTTPException as exc:
+        return notice_error_response(exc)
 
 
 @app.post("/api/professors/{professor_id}/notices", response_model=NoticeResponse, status_code=status.HTTP_201_CREATED)
@@ -193,12 +181,15 @@ def add_notice(
     payload: NoticeCreate,
     authenticated_login_id: str = Depends(require_authenticated_login_id),
     db: Session = Depends(get_db),
-) -> NoticeResponse:
-    ensure_path_user_matches(authenticated_login_id, professor_id)
-    notice = create_notice(db, professor_id, payload.title, payload.body, payload.course_code)
-    notices = list_notices(db, professor_id)
-    created = next(item for item in notices if item["id"] == notice.id)
-    return NoticeResponse(data=NoticeRead(**created), message="created", meta={"professor_id": professor_id})
+) -> NoticeResponse | JSONResponse:
+    try:
+        ensure_path_user_matches(authenticated_login_id, professor_id)
+        notice = create_notice(db, professor_id, payload.title, payload.body, payload.course_code)
+        notices = list_notices(db, professor_id)
+        created = next(item for item in notices if item["id"] == notice.id)
+        return NoticeResponse(data=NoticeRead(**created), message="created", meta={"professor_id": professor_id})
+    except HTTPException as exc:
+        return notice_error_response(exc)
 
 
 @app.get("/api/admin/users", response_model=list[UserSummary])
