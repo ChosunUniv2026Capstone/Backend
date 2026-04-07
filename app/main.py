@@ -1,13 +1,16 @@
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
+from app.models import RegisteredDevice, User
 from app.presence_client import PresenceClient
 from app.schemas import (
+    AdminPresenceSnapshotMutationRequest,
+    AdminPresenceSnapshotRead,
     AttendanceEligibilityRequest,
     AttendanceEligibilityResponse,
     AuthLoginRequest,
@@ -29,17 +32,18 @@ from app.services import (
     authenticate_user,
     check_attendance_eligibility,
     create_device,
+    create_notice,
     delete_device,
-    get_user_login_id,
     get_notice_detail,
+    get_user_by_login_id,
+    get_user_login_id,
     list_classroom_networks,
     list_classrooms,
+    list_devices,
     list_notices,
     list_professor_courses,
     list_student_courses,
     list_users,
-    list_devices,
-    create_notice,
 )
 
 settings = get_settings()
@@ -53,6 +57,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def api_error(status_code: int, code: str, message: str, details: dict | None = None) -> HTTPException:
     return HTTPException(
@@ -80,7 +85,7 @@ def notice_error_response(exc: HTTPException) -> JSONResponse:
     )
 
 
-def require_authenticated_login_id(authorization: str | None = Header(default=None)) -> str:
+def parse_bearer_login_id(authorization: str | None) -> str:
     if not authorization:
         raise api_error(
             status.HTTP_401_UNAUTHORIZED,
@@ -106,14 +111,97 @@ def require_authenticated_login_id(authorization: str | None = Header(default=No
     return login_id
 
 
-def ensure_path_user_matches(authenticated_login_id: str, requested_login_id: str) -> None:
-    if authenticated_login_id != requested_login_id:
+def require_authenticated_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    login_id = parse_bearer_login_id(authorization)
+    try:
+        return get_user_by_login_id(db, login_id)
+    except HTTPException as exc:
+        raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "invalid access token") from exc
+
+
+def require_admin_role(current_user: User = Depends(require_authenticated_user)) -> User:
+    if current_user.role != "admin":
+        raise api_error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "admin role is required")
+    return current_user
+
+
+def require_student_self(student_id: str, current_user: User) -> None:
+    if current_user.role != "student" or get_user_login_id(current_user) != student_id:
+        raise api_error(
+            status.HTTP_403_FORBIDDEN,
+            "FORBIDDEN",
+            "requested student does not match the authenticated user",
+            {"student_id": student_id},
+        )
+
+
+def require_professor_self(professor_id: str, current_user: User) -> None:
+    if current_user.role != "professor" or get_user_login_id(current_user) != professor_id:
+        raise api_error(
+            status.HTTP_403_FORBIDDEN,
+            "FORBIDDEN",
+            "requested professor does not match the authenticated user",
+            {"professor_id": professor_id},
+        )
+
+
+def require_login_match(requested_login_id: str, current_user: User) -> None:
+    if get_user_login_id(current_user) != requested_login_id:
         raise api_error(
             status.HTTP_403_FORBIDDEN,
             "FORBIDDEN",
             "requested user does not match the authenticated user",
             {"requested_login_id": requested_login_id},
         )
+
+
+def map_presence_snapshot(snapshot_payload: dict, db: Session) -> dict:
+    owner_rows = db.execute(
+        select(
+            RegisteredDevice.mac_address,
+            RegisteredDevice.label,
+            User.name,
+            User.student_id,
+            User.professor_id,
+            User.admin_id,
+        ).join(User, User.id == RegisteredDevice.user_id)
+    )
+    device_index = {}
+    for mac_address, device_label, name, student_id, professor_id, admin_id in owner_rows:
+        login_id = student_id or professor_id or admin_id or ""
+        device_index[mac_address.lower()] = {
+            "deviceLabel": device_label,
+            "ownerName": name,
+            "ownerLoginId": login_id,
+        }
+
+    snapshot = snapshot_payload["snapshot"]
+    aps = []
+    for ap in snapshot.get("aps", []):
+        stations = []
+        for station in ap.get("stations", []):
+            owner = device_index.get(station["macAddress"].lower())
+            stations.append(
+                {
+                    **station,
+                    "deviceLabel": owner["deviceLabel"] if owner else None,
+                    "ownerName": owner["ownerName"] if owner else None,
+                    "ownerLoginId": owner["ownerLoginId"] if owner else None,
+                }
+            )
+        aps.append({**ap, "stations": stations})
+
+    return {
+        "cacheHit": snapshot_payload.get("cacheHit", False),
+        "overlayActive": snapshot_payload.get("overlayActive", False),
+        "classroomCode": snapshot.get("classroomId"),
+        "observedAt": snapshot.get("observedAt"),
+        "collectionMode": snapshot.get("collectionMode"),
+        "aps": aps,
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -137,23 +225,33 @@ def login(payload: AuthLoginRequest, db: Session = Depends(get_db)) -> AuthLogin
 
 
 @app.get("/api/students/{student_id}/courses", response_model=list[CourseRead])
-def get_student_courses(student_id: str, db: Session = Depends(get_db)) -> list[CourseRead]:
+def get_student_courses(
+    student_id: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[CourseRead]:
+    require_student_self(student_id, current_user)
     return [CourseRead(**course) for course in list_student_courses(db, student_id)]
 
 
 @app.get("/api/professors/{professor_id}/courses", response_model=list[CourseRead])
-def get_professor_courses(professor_id: str, db: Session = Depends(get_db)) -> list[CourseRead]:
+def get_professor_courses(
+    professor_id: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[CourseRead]:
+    require_professor_self(professor_id, current_user)
     return [CourseRead(**course) for course in list_professor_courses(db, professor_id)]
 
 
 @app.get("/api/notices/{login_id}", response_model=NoticeListResponse)
 def get_notices(
     login_id: str,
-    authenticated_login_id: str = Depends(require_authenticated_login_id),
+    current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> NoticeListResponse | JSONResponse:
     try:
-        ensure_path_user_matches(authenticated_login_id, login_id)
+        require_login_match(login_id, current_user)
         notices = [NoticeRead(**notice) for notice in list_notices(db, login_id)]
         return NoticeListResponse(data=notices, meta={"login_id": login_id, "count": len(notices)})
     except HTTPException as exc:
@@ -164,11 +262,11 @@ def get_notices(
 def get_notice(
     login_id: str,
     notice_id: int,
-    authenticated_login_id: str = Depends(require_authenticated_login_id),
+    current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> NoticeResponse | JSONResponse:
     try:
-        ensure_path_user_matches(authenticated_login_id, login_id)
+        require_login_match(login_id, current_user)
         notice = NoticeRead(**get_notice_detail(db, login_id, notice_id))
         return NoticeResponse(data=notice, meta={"login_id": login_id})
     except HTTPException as exc:
@@ -179,11 +277,11 @@ def get_notice(
 def add_notice(
     professor_id: str,
     payload: NoticeCreate,
-    authenticated_login_id: str = Depends(require_authenticated_login_id),
+    current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> NoticeResponse | JSONResponse:
     try:
-        ensure_path_user_matches(authenticated_login_id, professor_id)
+        require_professor_self(professor_id, current_user)
         notice = create_notice(db, professor_id, payload.title, payload.body, payload.course_code)
         notices = list_notices(db, professor_id)
         created = next(item for item in notices if item["id"] == notice.id)
@@ -193,22 +291,70 @@ def add_notice(
 
 
 @app.get("/api/admin/users", response_model=list[UserSummary])
-def get_users(db: Session = Depends(get_db)) -> list[UserSummary]:
+def get_users(
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> list[UserSummary]:
     return [UserSummary(**user) for user in list_users(db)]
 
 
 @app.get("/api/admin/classrooms", response_model=list[ClassroomRead])
-def get_classrooms(db: Session = Depends(get_db)) -> list[ClassroomRead]:
+def get_classrooms(
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> list[ClassroomRead]:
     return [ClassroomRead(**classroom) for classroom in list_classrooms(db)]
 
 
 @app.get("/api/admin/classroom-networks", response_model=list[ClassroomNetworkRead])
-def get_classroom_networks(db: Session = Depends(get_db)) -> list[ClassroomNetworkRead]:
+def get_classroom_networks(
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> list[ClassroomNetworkRead]:
     return [ClassroomNetworkRead(**network) for network in list_classroom_networks(db)]
 
 
+@app.get("/api/admin/presence/classrooms/{classroomCode}/snapshot", response_model=AdminPresenceSnapshotRead)
+def get_admin_presence_snapshot(
+    classroomCode: str,
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> AdminPresenceSnapshotRead:
+    snapshot_payload = presence_client.get_admin_snapshot(classroom_code=classroomCode)
+    return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
+
+
+@app.post("/api/admin/presence/classrooms/{classroomCode}/dummy-controls", response_model=AdminPresenceSnapshotRead)
+def apply_admin_presence_overlay(
+    classroomCode: str,
+    payload: AdminPresenceSnapshotMutationRequest,
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> AdminPresenceSnapshotRead:
+    snapshot_payload = presence_client.apply_admin_overlay(
+        classroom_code=classroomCode,
+        payload=payload.model_dump(by_alias=True),
+    )
+    return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
+
+
+@app.post("/api/admin/presence/classrooms/{classroomCode}/dummy-controls/reset", response_model=AdminPresenceSnapshotRead)
+def reset_admin_presence_overlay(
+    classroomCode: str,
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> AdminPresenceSnapshotRead:
+    snapshot_payload = presence_client.reset_admin_overlay(classroom_code=classroomCode)
+    return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
+
+
 @app.get("/api/students/{student_id}/devices", response_model=list[DeviceRead])
-def get_devices(student_id: str, db: Session = Depends(get_db)) -> list[DeviceRead]:
+def get_devices(
+    student_id: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[DeviceRead]:
+    require_student_self(student_id, current_user)
     return [
         DeviceRead(
             id=device.id,
@@ -223,7 +369,13 @@ def get_devices(student_id: str, db: Session = Depends(get_db)) -> list[DeviceRe
 
 
 @app.post("/api/students/{student_id}/devices", response_model=DeviceRead, status_code=status.HTTP_201_CREATED)
-def add_device(student_id: str, payload: DeviceCreate, db: Session = Depends(get_db)) -> DeviceRead:
+def add_device(
+    student_id: str,
+    payload: DeviceCreate,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> DeviceRead:
+    require_student_self(student_id, current_user)
     device = create_device(db, student_id, payload)
     return DeviceRead(
         id=device.id,
@@ -236,7 +388,13 @@ def add_device(student_id: str, payload: DeviceCreate, db: Session = Depends(get
 
 
 @app.delete("/api/students/{student_id}/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_device(student_id: str, device_id: int, db: Session = Depends(get_db)) -> Response:
+def remove_device(
+    student_id: str,
+    device_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    require_student_self(student_id, current_user)
     delete_device(db, student_id, device_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -247,8 +405,10 @@ def remove_device(student_id: str, device_id: int, db: Session = Depends(get_db)
 )
 def attendance_eligibility(
     payload: AttendanceEligibilityRequest,
+    current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> AttendanceEligibilityResponse:
+    require_student_self(payload.student_id, current_user)
     result = check_attendance_eligibility(
         db=db,
         presence_client=presence_client,

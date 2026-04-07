@@ -29,3 +29,28 @@ class PresenceClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def get_admin_snapshot(self, *, classroom_code: str) -> dict[str, Any]:
+        response = httpx.get(
+            f"{self._base_url}/admin/dummy/classrooms/{classroom_code}/snapshot",
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def apply_admin_overlay(self, *, classroom_code: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = httpx.post(
+            f"{self._base_url}/admin/dummy/classrooms/{classroom_code}/overlay",
+            json=payload,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def reset_admin_overlay(self, *, classroom_code: str) -> dict[str, Any]:
+        response = httpx.post(
+            f"{self._base_url}/admin/dummy/classrooms/{classroom_code}/overlay/reset",
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return response.json()

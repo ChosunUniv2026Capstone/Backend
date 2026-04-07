@@ -1,8 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import ConfigDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HealthResponse(BaseModel):
@@ -117,3 +116,50 @@ class AttendanceEligibilityResponse(BaseModel):
     observed_at: datetime | None = None
     snapshot_age_seconds: int | None = None
     evidence: dict
+
+
+class AdminPresenceStationMutation(BaseModel):
+    mac_address: str = Field(alias="macAddress")
+    ap_id: str | None = Field(default=None, alias="apId")
+    present: bool = True
+    associated: bool | None = None
+    authorized: bool | None = None
+    authenticated: bool | None = None
+    signal_dbm: int | None = Field(default=None, alias="signalDbm")
+    connected_seconds: int | None = Field(default=None, alias="connectedSeconds")
+    rx_bytes: int | None = Field(default=None, alias="rxBytes")
+    tx_bytes: int | None = Field(default=None, alias="txBytes")
+
+
+class AdminPresenceSnapshotMutationRequest(BaseModel):
+    stations: list[AdminPresenceStationMutation] = Field(default_factory=list)
+
+
+class AdminPresenceStationRead(BaseModel):
+    mac_address: str = Field(alias="macAddress")
+    associated: bool | None = None
+    authenticated: bool | None = None
+    authorized: bool | None = None
+    signal_dbm: int | None = Field(default=None, alias="signalDbm")
+    connected_seconds: int | None = Field(default=None, alias="connectedSeconds")
+    rx_bytes: int | None = Field(default=None, alias="rxBytes")
+    tx_bytes: int | None = Field(default=None, alias="txBytes")
+    device_label: str | None = Field(default=None, alias="deviceLabel")
+    owner_name: str | None = Field(default=None, alias="ownerName")
+    owner_login_id: str | None = Field(default=None, alias="ownerLoginId")
+
+
+class AdminPresenceAccessPointRead(BaseModel):
+    ap_id: str = Field(alias="apId")
+    ssid: str
+    source_command: str = Field(alias="sourceCommand")
+    stations: list[AdminPresenceStationRead]
+
+
+class AdminPresenceSnapshotRead(BaseModel):
+    cache_hit: bool = Field(alias="cacheHit")
+    overlay_active: bool = Field(alias="overlayActive")
+    classroom_code: str = Field(alias="classroomCode")
+    observed_at: datetime | None = Field(default=None, alias="observedAt")
+    collection_mode: str | None = Field(default=None, alias="collectionMode")
+    aps: list[AdminPresenceAccessPointRead]
