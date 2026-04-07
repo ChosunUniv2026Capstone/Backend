@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 class FakePresenceClient:
     def __init__(self) -> None:
         self.last_overlay_payload = None
+        self.last_eligibility_payload = None
 
     def get_admin_snapshot(self, *, classroom_code: str):
         assert classroom_code == "B101"
@@ -58,10 +59,28 @@ class FakePresenceClient:
         payload["overlayActive"] = False
         return payload
 
-    def check_eligibility(self, *, student_id: str, course_id: str, classroom_id: str, purpose: str, registered_devices: list[dict]):
+    def check_eligibility(
+        self,
+        *,
+        student_id: str,
+        course_id: str,
+        classroom_id: str,
+        purpose: str,
+        classroom_networks: list[dict],
+        registered_devices: list[dict],
+    ):
+        self.last_eligibility_payload = {
+            "student_id": student_id,
+            "course_id": course_id,
+            "classroom_id": classroom_id,
+            "purpose": purpose,
+            "classroom_networks": classroom_networks,
+            "registered_devices": registered_devices,
+        }
         assert student_id == "20201239"
         assert course_id == "CSE116"
         assert classroom_id == "B101"
+        assert classroom_networks[0]["apId"] == "phy3-ap0"
         return {
             "eligible": True,
             "reasonCode": "OK",
@@ -165,10 +184,12 @@ def test_admin_presence_snapshot_enriches_owner_data() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["classroomCode"] == "B101"
+    assert payload["classroomNetworks"][0]["signal_threshold_dbm"] is None
     station = payload["aps"][0]["stations"][0]
     assert station["ownerLoginId"] == "20201239"
     assert station["ownerName"] == "Kim Student 06"
     assert station["deviceLabel"] == "Choi Phone"
+    assert any(option["macAddress"] == "52:54:00:12:34:56" for option in payload["deviceOptions"])
 
 
 def test_admin_presence_overlay_proxies_payload() -> None:
@@ -206,7 +227,7 @@ def test_admin_presence_overlay_proxies_payload() -> None:
 
 
 def test_generic_attendance_eligibility_requires_student_self() -> None:
-    client, _ = make_client()
+    client, fake_presence_client = make_client()
     forbidden = client.post(
         "/api/attendance/eligibility",
         headers=auth_header("ADM001"),
@@ -231,3 +252,30 @@ def test_generic_attendance_eligibility_requires_student_self() -> None:
     )
     assert allowed.status_code == 200
     assert allowed.json()["eligible"] is True
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
+
+
+def test_generic_attendance_eligibility_resolves_classroom_from_course_mapping() -> None:
+    client, fake_presence_client = make_client()
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={
+            "student_id": "20201239",
+            "course_id": "CSE116",
+            "purpose": "attendance",
+        },
+    )
+    assert response.status_code == 200
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
+
+
+def test_admin_can_update_network_threshold() -> None:
+    client, _ = make_client()
+    response = client.patch(
+        "/api/admin/classroom-networks/1",
+        headers=auth_header("ADM001"),
+        json={"signal_threshold_dbm": -55},
+    )
+    assert response.status_code == 200
+    assert response.json()["signal_threshold_dbm"] == -55

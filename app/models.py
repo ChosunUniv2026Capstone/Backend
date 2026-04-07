@@ -79,6 +79,7 @@ class ClassroomNetwork(Base):
     ap_id: Mapped[str] = mapped_column(String(64))
     ssid: Mapped[str] = mapped_column(String(120))
     gateway_host: Mapped[str] = mapped_column(String(120), nullable=True)
+    signal_threshold_dbm: Mapped[int | None] = mapped_column(Integer, nullable=True)
     collection_mode: Mapped[str] = mapped_column(String(40))
 
 

@@ -14,6 +14,7 @@ class PresenceClient:
         course_id: str,
         classroom_id: str,
         purpose: str,
+        classroom_networks: list[dict[str, Any]],
         registered_devices: list[dict[str, str]],
     ) -> dict[str, Any]:
         response = httpx.post(
@@ -23,6 +24,7 @@ class PresenceClient:
                 "courseId": course_id,
                 "classroomId": classroom_id,
                 "purpose": purpose,
+                "classroomNetworks": classroom_networks,
                 "registeredDevices": registered_devices,
             },
             timeout=10.0,

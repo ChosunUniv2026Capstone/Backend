@@ -9,6 +9,7 @@ from app.db import get_db
 from app.models import RegisteredDevice, User
 from app.presence_client import PresenceClient
 from app.schemas import (
+    AdminClassroomNetworkThresholdUpdate,
     AdminPresenceSnapshotMutationRequest,
     AdminPresenceSnapshotRead,
     AttendanceEligibilityRequest,
@@ -38,12 +39,15 @@ from app.services import (
     get_user_by_login_id,
     get_user_login_id,
     list_classroom_networks,
+    list_classroom_networks_for_classroom,
     list_classrooms,
     list_devices,
     list_notices,
+    list_presence_device_options,
     list_professor_courses,
     list_student_courses,
     list_users,
+    update_classroom_network_threshold,
 )
 
 settings = get_settings()
@@ -179,10 +183,13 @@ def map_presence_snapshot(snapshot_payload: dict, db: Session) -> dict:
         }
 
     snapshot = snapshot_payload["snapshot"]
+    classroom_code = snapshot.get("classroomId")
     aps = []
+    observed_macs: set[str] = set()
     for ap in snapshot.get("aps", []):
         stations = []
         for station in ap.get("stations", []):
+            observed_macs.add(station["macAddress"].lower())
             owner = device_index.get(station["macAddress"].lower())
             stations.append(
                 {
@@ -194,13 +201,43 @@ def map_presence_snapshot(snapshot_payload: dict, db: Session) -> dict:
             )
         aps.append({**ap, "stations": stations})
 
+    device_options = list_presence_device_options(db, classroom_code)
+    device_option_index = {option["mac_address"].lower(): option for option in device_options}
+    for ap in aps:
+        for station in ap["stations"]:
+            mac_address = station["macAddress"].lower()
+            if mac_address not in device_option_index:
+                device_options.append(
+                    {
+                        "student_login_id": station.get("ownerLoginId"),
+                        "student_name": station.get("ownerName"),
+                        "device_label": station.get("deviceLabel"),
+                        "mac_address": mac_address,
+                        "observed": True,
+                    }
+                )
+            else:
+                device_option_index[mac_address]["observed"] = True
+    for option in device_options:
+        option["observed"] = option["mac_address"].lower() in observed_macs
+    device_options.sort(
+        key=lambda item: (
+            item["student_login_id"] or "zzzz",
+            item["student_name"] or "zzzz",
+            item["device_label"] or "zzzz",
+            item["mac_address"],
+        )
+    )
+
     return {
         "cacheHit": snapshot_payload.get("cacheHit", False),
         "overlayActive": snapshot_payload.get("overlayActive", False),
-        "classroomCode": snapshot.get("classroomId"),
+        "classroomCode": classroom_code,
         "observedAt": snapshot.get("observedAt"),
         "collectionMode": snapshot.get("collectionMode"),
         "aps": aps,
+        "classroomNetworks": list_classroom_networks_for_classroom(db, classroom_code),
+        "deviceOptions": device_options,
     }
 
 
@@ -312,6 +349,16 @@ def get_classroom_networks(
     db: Session = Depends(get_db),
 ) -> list[ClassroomNetworkRead]:
     return [ClassroomNetworkRead(**network) for network in list_classroom_networks(db)]
+
+
+@app.patch("/api/admin/classroom-networks/{network_id}", response_model=ClassroomNetworkRead)
+def patch_classroom_network_threshold(
+    network_id: int,
+    payload: AdminClassroomNetworkThresholdUpdate,
+    _: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> ClassroomNetworkRead:
+    return ClassroomNetworkRead(**update_classroom_network_threshold(db, network_id, payload.signal_threshold_dbm))
 
 
 @app.get("/api/admin/presence/classrooms/{classroomCode}/snapshot", response_model=AdminPresenceSnapshotRead)

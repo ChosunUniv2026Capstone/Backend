@@ -306,6 +306,7 @@ def list_classroom_networks(db: Session) -> list[dict]:
             ClassroomNetwork.ap_id,
             ClassroomNetwork.ssid,
             ClassroomNetwork.gateway_host,
+            ClassroomNetwork.signal_threshold_dbm,
             ClassroomNetwork.collection_mode,
         )
         .join(Classroom, Classroom.id == ClassroomNetwork.classroom_id)
@@ -318,28 +319,120 @@ def list_classroom_networks(db: Session) -> list[dict]:
             "ap_id": row[2],
             "ssid": row[3],
             "gateway_host": row[4],
-            "collection_mode": row[5],
+            "signal_threshold_dbm": row[5],
+            "collection_mode": row[6],
         }
         for row in rows
     ]
 
 
-def _is_schedule_active(db: Session, course_id: str, classroom_id: str) -> bool:
+def list_classroom_networks_for_classroom(db: Session, classroom_code: str) -> list[dict]:
+    return [
+        network
+        for network in list_classroom_networks(db)
+        if network["classroom_code"] == classroom_code
+    ]
+
+
+def resolve_active_classroom_for_course(db: Session, course_id: str) -> str:
     now = datetime.now()
     weekday = now.weekday()
     current_time = now.time()
-    return db.scalar(
-        select(CourseSchedule.id)
+    rows = db.execute(
+        select(Classroom.classroom_code)
+        .select_from(CourseSchedule)
         .join(Course, Course.id == CourseSchedule.course_id)
         .join(Classroom, Classroom.id == CourseSchedule.classroom_id)
         .where(
             Course.course_code == course_id,
-            Classroom.classroom_code == classroom_id,
             CourseSchedule.day_of_week == weekday,
             CourseSchedule.starts_at <= current_time,
             CourseSchedule.ends_at >= current_time,
         )
-    ) is not None
+    )
+    classroom_codes = {row[0] for row in rows}
+    if not classroom_codes:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OUTSIDE_CLASS_WINDOW",
+                "message": "no active classroom mapping for the current course window",
+                "details": {"course_code": course_id},
+            },
+        )
+    if len(classroom_codes) == 1:
+        return classroom_codes.pop()
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "CLASSROOM_CONFLICT",
+            "message": "multiple active classrooms were resolved for the current course window",
+            "details": {"course_code": course_id, "classroom_codes": sorted(classroom_codes)},
+        },
+    )
+
+
+def list_presence_device_options(db: Session, classroom_code: str) -> list[dict]:
+    now = datetime.now()
+    weekday = now.weekday()
+    current_time = now.time()
+    observed_rows = db.execute(
+        select(
+            RegisteredDevice.mac_address,
+            RegisteredDevice.label,
+            User.student_id,
+            User.name,
+        )
+        .join(User, User.id == RegisteredDevice.user_id)
+        .join(CourseEnrollment, CourseEnrollment.student_user_id == User.id)
+        .join(CourseSchedule, CourseSchedule.course_id == CourseEnrollment.course_id)
+        .join(Classroom, Classroom.id == CourseSchedule.classroom_id)
+        .where(
+            User.role == "student",
+            CourseEnrollment.status == "active",
+            Classroom.classroom_code == classroom_code,
+            CourseSchedule.day_of_week == weekday,
+            CourseSchedule.starts_at <= current_time,
+            CourseSchedule.ends_at >= current_time,
+        )
+    )
+
+    device_index: dict[str, dict] = {}
+    for mac_address, device_label, student_id, student_name in observed_rows:
+        device_index[mac_address.lower()] = {
+            "student_login_id": student_id,
+            "student_name": student_name,
+            "device_label": device_label,
+            "mac_address": mac_address.lower(),
+            "observed": False,
+        }
+    return sorted(device_index.values(), key=lambda item: (item["student_login_id"], item["device_label"], item["mac_address"]))
+
+
+def update_classroom_network_threshold(db: Session, network_id: int, signal_threshold_dbm: int | None) -> dict:
+    network = db.scalar(select(ClassroomNetwork).where(ClassroomNetwork.id == network_id))
+    if network is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CLASSROOM_NETWORK_NOT_FOUND",
+                "message": "classroom network not found",
+                "details": {"network_id": network_id},
+            },
+        )
+    network.signal_threshold_dbm = signal_threshold_dbm
+    db.commit()
+    db.refresh(network)
+    classroom = db.scalar(select(Classroom).where(Classroom.id == network.classroom_id))
+    return {
+        "id": network.id,
+        "classroom_code": classroom.classroom_code if classroom else "",
+        "ap_id": network.ap_id,
+        "ssid": network.ssid,
+        "gateway_host": network.gateway_host,
+        "signal_threshold_dbm": network.signal_threshold_dbm,
+        "collection_mode": network.collection_mode,
+    }
 
 
 def check_attendance_eligibility(
@@ -348,20 +441,22 @@ def check_attendance_eligibility(
     presence_client: PresenceClient,
     student_id: str,
     course_id: str,
-    classroom_id: str,
-    purpose: str,
+    classroom_id: str | None,
+    purpose: str = "attendance",
 ) -> dict:
     if not _is_enrolled(db, student_id, course_id):
         raise HTTPException(status_code=403, detail="student is not enrolled in the course")
 
-    if not _is_schedule_active(db, course_id, classroom_id):
+    try:
+        resolved_classroom_id = resolve_active_classroom_for_course(db, course_id)
+    except HTTPException as exc:
         return {
             "eligible": False,
-            "reason_code": "OUTSIDE_CLASS_WINDOW",
+            "reason_code": exc.detail["code"] if isinstance(exc.detail, dict) else "OUTSIDE_CLASS_WINDOW",
             "matched_device_mac": None,
             "observed_at": None,
             "snapshot_age_seconds": None,
-            "evidence": {},
+            "evidence": exc.detail.get("details", {}) if isinstance(exc.detail, dict) else {},
         }
 
     devices = [device for device in list_devices(db, student_id) if device.status == "active"]
@@ -379,8 +474,16 @@ def check_attendance_eligibility(
     presence_payload = presence_client.check_eligibility(
         student_id=student_id,
         course_id=course_id,
-        classroom_id=classroom_id,
+        classroom_id=resolved_classroom_id,
         purpose=purpose,
+        classroom_networks=[
+            {
+                "apId": network["ap_id"],
+                "ssid": network["ssid"],
+                "signalThresholdDbm": network["signal_threshold_dbm"],
+            }
+            for network in list_classroom_networks_for_classroom(db, resolved_classroom_id)
+        ],
         registered_devices=registered_devices,
     )
 

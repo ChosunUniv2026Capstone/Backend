@@ -83,6 +83,7 @@ class ClassroomNetworkRead(BaseModel):
     ap_id: str
     ssid: str
     gateway_host: str | None = None
+    signal_threshold_dbm: int | None = None
     collection_mode: str
 
 
@@ -105,7 +106,7 @@ class DeviceRead(BaseModel):
 class AttendanceEligibilityRequest(BaseModel):
     student_id: str
     course_id: str
-    classroom_id: str
+    classroom_id: str | None = None
     purpose: str = Field(default="attendance")
 
 
@@ -149,6 +150,16 @@ class AdminPresenceStationRead(BaseModel):
     owner_login_id: str | None = Field(default=None, alias="ownerLoginId")
 
 
+class AdminPresenceDeviceOptionRead(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    student_login_id: str | None = Field(default=None, alias="studentLoginId")
+    student_name: str | None = Field(default=None, alias="studentName")
+    device_label: str | None = Field(default=None, alias="deviceLabel")
+    mac_address: str = Field(alias="macAddress")
+    observed: bool = False
+
+
 class AdminPresenceAccessPointRead(BaseModel):
     ap_id: str = Field(alias="apId")
     ssid: str
@@ -163,3 +174,9 @@ class AdminPresenceSnapshotRead(BaseModel):
     observed_at: datetime | None = Field(default=None, alias="observedAt")
     collection_mode: str | None = Field(default=None, alias="collectionMode")
     aps: list[AdminPresenceAccessPointRead]
+    classroom_networks: list[ClassroomNetworkRead] = Field(default_factory=list, alias="classroomNetworks")
+    device_options: list[AdminPresenceDeviceOptionRead] = Field(default_factory=list, alias="deviceOptions")
+
+
+class AdminClassroomNetworkThresholdUpdate(BaseModel):
+    signal_threshold_dbm: int | None = None
