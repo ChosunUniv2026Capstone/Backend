@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.auth import issue_access_token
 from app.db import get_db
 from app.main import app
 from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, RegisteredDevice, User
@@ -237,6 +238,13 @@ def test_admin_routes_require_admin_role() -> None:
     assert len(response.json()) == 4
 
 
+def test_invalid_access_token_returns_stable_auth_code() -> None:
+    client, _ = make_client()
+    response = client.get("/api/admin/users", headers={"Authorization": "Bearer not-a-dev-token"})
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+
+
 def test_student_routes_require_self() -> None:
     client, _ = make_client()
     own_response = client.get("/api/students/20201239/courses", headers=auth_header("20201239"))
@@ -257,6 +265,110 @@ def test_admin_presence_snapshot_enriches_owner_data() -> None:
     assert station["ownerName"] == "Kim Student 06"
     assert station["deviceLabel"] == "Choi Phone"
     assert any(option["macAddress"] == "52:54:00:12:34:56" for option in payload["deviceOptions"])
+
+
+def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
+    client, _ = make_client()
+    login = client.post("/api/auth/login", json={"login_id": "20201239", "password": "devpass123"})
+    assert login.status_code == 200
+    payload = login.json()
+    assert payload["success"] is True
+    assert payload["data"]["user"]["login_id"] == "20201239"
+    assert payload["data"]["access_token"].count(".") == 2
+    assert payload["access_token"] == payload["data"]["access_token"]
+    assert login.cookies.get("smartclass_refresh")
+
+    bootstrap = client.get("/api/auth/bootstrap")
+    assert bootstrap.status_code == 200
+    bootstrap_payload = bootstrap.json()
+    assert bootstrap_payload["success"] is True
+    assert bootstrap_payload["meta"]["restored_via"] == "refresh-cookie"
+    assert bootstrap_payload["data"]["user"]["login_id"] == "20201239"
+    assert "CSE116" in bootstrap_payload["data"]["route_access"]["student_course_codes"]
+
+
+def test_refresh_rotates_cookie_and_rejects_replay() -> None:
+    client, _ = make_client()
+    login = client.post("/api/auth/login", json={"login_id": "20201239", "password": "devpass123"})
+    first_refresh_cookie = login.cookies.get("smartclass_refresh")
+    assert first_refresh_cookie
+
+    refresh = client.post("/api/auth/refresh")
+    assert refresh.status_code == 200
+    refreshed_cookie = refresh.cookies.get("smartclass_refresh")
+    assert refreshed_cookie
+    assert refreshed_cookie != first_refresh_cookie
+
+    client.cookies.set("smartclass_refresh", first_refresh_cookie, domain="testserver.local", path="/api/auth")
+    replay = client.post("/api/auth/refresh")
+    assert replay.status_code == 401
+    assert replay.json()["error"]["code"] == "REFRESH_REPLAY_DETECTED"
+
+
+def test_logout_revokes_cookie_backed_restore() -> None:
+    client, _ = make_client()
+    login = client.post("/api/auth/login", json={"login_id": "20201239", "password": "devpass123"})
+    assert login.status_code == 200
+
+    logout = client.post("/api/auth/logout")
+    assert logout.status_code == 200
+    assert logout.json()["data"]["logged_out"] is True
+
+    bootstrap = client.get("/api/auth/bootstrap")
+    assert bootstrap.status_code == 401
+    assert bootstrap.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+def test_expired_access_token_returns_stable_code() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        expired_access = issue_access_token(student, ttl_seconds=-5).token
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/students/20201239/courses",
+        headers={"Authorization": f"Bearer {expired_access}"},
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "TOKEN_EXPIRED"
+
+
+def test_attendance_bootstrap_rejects_unauthorized_course_routes() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        other_professor = User(professor_id="PRF777", name="Other Professor", role="professor", password="devpass123")
+        db.add(other_professor)
+        db.flush()
+        db.add(Course(course_code="CSE999", title="Other Course", professor_user_id=other_professor.id))
+        db.commit()
+    finally:
+        db.close()
+
+    student_bootstrap = client.get(
+        "/api/students/20201239/courses/CSE999/attendance/bootstrap",
+        headers=auth_header("20201239"),
+    )
+    assert student_bootstrap.status_code == 403
+    assert student_bootstrap.json()["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
+
+    professor_bootstrap = client.get(
+        "/api/professors/PRF002/courses/CSE999/attendance/bootstrap",
+        headers=auth_header("PRF002"),
+    )
+    assert professor_bootstrap.status_code == 403
+    assert professor_bootstrap.json()["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
 
 
 def test_admin_presence_overlay_proxies_payload() -> None:

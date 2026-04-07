@@ -1,6 +1,6 @@
 from datetime import datetime, time
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Time, UniqueConstraint, func
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Time, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -92,3 +92,82 @@ class Notice(Base):
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AttendanceSession(Base):
+    __tablename__ = "attendance_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    projection_key: Mapped[str] = mapped_column(String(255), index=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    classroom_id: Mapped[int] = mapped_column(ForeignKey("classrooms.id"), index=True)
+    session_date: Mapped[datetime.date] = mapped_column(Date)
+    slot_start_at: Mapped[time] = mapped_column(Time)
+    slot_end_at: Mapped[time] = mapped_column(Time)
+    mode: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    opened_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    latest_version: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class AttendanceRecord(Base):
+    __tablename__ = "attendance_records"
+    __table_args__ = (UniqueConstraint("attendance_session_id", "student_user_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
+    student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    final_status: Mapped[str] = mapped_column(String(16))
+    attendance_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    finalized_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class AttendanceStatusAuditLog(Base):
+    __tablename__ = "attendance_status_audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
+    student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    actor_role: Mapped[str] = mapped_column(String(16))
+    change_source: Mapped[str] = mapped_column(String(32))
+    previous_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    new_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    current_token_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

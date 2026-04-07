@@ -178,3 +178,13 @@ class AdminPresenceSnapshotRead(BaseModel):
 
 class AdminClassroomNetworkThresholdUpdate(BaseModel):
     signal_threshold_dbm: int | None = None
+
+
+class AttendanceSessionBatchRequest(BaseModel):
+    projection_keys: list[str] = Field(default_factory=list)
+    mode: Literal["manual", "smart", "canceled"]
+
+
+class AttendanceRecordUpdateRequest(BaseModel):
+    status: Literal["present", "absent", "late", "official", "sick"]
+    reason: str

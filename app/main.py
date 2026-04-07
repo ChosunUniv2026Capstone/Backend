@@ -1,19 +1,51 @@
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from collections import defaultdict
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.auth import (
+    RefreshRotationBundle,
+    auth_error,
+    create_login_session,
+    revoke_refresh_session,
+    rotate_refresh_session,
+    verify_access_token,
+)
 from app.config import get_settings
-from app.db import get_db
-from app.models import RegisteredDevice, User
+from app.db import SessionLocal, get_db
+from app.attendance import (
+    attendance_event_payload,
+    build_attendance_report,
+    build_attendance_timeline,
+    close_attendance_session,
+    expire_stale_attendance_sessions,
+    get_attendance_session_roster,
+    get_attendance_slot_roster_preview,
+    get_course_by_code,
+    get_owned_course,
+    get_student_user,
+    list_attendance_history,
+    list_student_active_attendance_sessions,
+    open_attendance_sessions_batch,
+    ensure_student_enrolled,
+    student_attendance_check_in,
+    update_attendance_session_record,
+)
+from app.models import Course, CourseEnrollment, RegisteredDevice, User
 from app.presence_client import PresenceClient
 from app.schemas import (
     AdminClassroomNetworkThresholdUpdate,
     AdminPresenceSnapshotMutationRequest,
     AdminPresenceSnapshotRead,
+    AttendanceRecordUpdateRequest,
     AttendanceEligibilityRequest,
     AttendanceEligibilityResponse,
+    AttendanceSessionBatchRequest,
     AuthLoginRequest,
     AuthLoginResponse,
     AuthUser,
@@ -53,14 +85,59 @@ from app.services import (
 settings = get_settings()
 presence_client = PresenceClient(settings.presence_service_url)
 
+
+def _cors_origins() -> list[str]:
+    if settings.cors_origins == "*":
+        return [origin.strip() for origin in settings.local_cors_origins.split(",") if origin.strip()]
+    return [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+
+
 app = FastAPI(title="Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.cors_origins == "*" else [origin.strip() for origin in settings.cors_origins.split(",")],
-    allow_credentials=False,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class AttendanceRealtimeBroker:
+    def __init__(self) -> None:
+        self._connections: dict[str, set[WebSocket]] = defaultdict(set)
+        self._connection_meta: dict[WebSocket, dict[str, Any]] = {}
+
+    async def connect(self, course_code: str, websocket: WebSocket, meta: dict[str, Any]) -> None:
+        await websocket.accept()
+        self._connections[course_code].add(websocket)
+        self._connection_meta[websocket] = meta
+
+    def disconnect(self, course_code: str, websocket: WebSocket) -> None:
+        if course_code in self._connections:
+            self._connections[course_code].discard(websocket)
+            if not self._connections[course_code]:
+                self._connections.pop(course_code, None)
+        self._connection_meta.pop(websocket, None)
+
+    async def publish(self, course_code: str, payload: dict[str, Any]) -> None:
+        sockets = list(self._connections.get(course_code, set()))
+        stale: list[WebSocket] = []
+        for websocket in sockets:
+            meta = self._connection_meta.get(websocket, {})
+            changed_student_id = payload.get("changed_payload", {}).get("student_id")
+            if meta.get("role") == "student" and changed_student_id and meta.get("login_id") != changed_student_id:
+                continue
+            if meta.get("role") == "admin" and meta.get("view") != "report":
+                continue
+            try:
+                await websocket.send_json(payload)
+            except RuntimeError:
+                stale.append(websocket)
+        for websocket in stale:
+            self.disconnect(course_code, websocket)
+
+
+attendance_broker = AttendanceRealtimeBroker()
 
 
 def api_error(status_code: int, code: str, message: str, details: dict | None = None) -> HTTPException:
@@ -71,6 +148,48 @@ def api_error(status_code: int, code: str, message: str, details: dict | None = 
             "message": message,
             "details": details or {},
         },
+    )
+
+
+def success_payload(
+    data: dict[str, Any],
+    *,
+    message: str = "ok",
+    meta: dict[str, Any] | None = None,
+    compatibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": True,
+        "data": data,
+        "message": message,
+        "meta": meta or {},
+    }
+    if compatibility:
+        payload.update(compatibility)
+    return payload
+
+
+def error_payload(status_code: int, code: str, message: str, details: dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": False,
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details or {},
+            },
+        },
+    )
+
+
+def error_response_from_exception(exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    return error_payload(
+        exc.status_code,
+        detail.get("code", "REQUEST_FAILED"),
+        detail.get("message", "request failed"),
+        detail.get("details", {}),
     )
 
 
@@ -89,6 +208,64 @@ def notice_error_response(exc: HTTPException) -> JSONResponse:
     )
 
 
+def serialize_auth_user(user: User) -> AuthUser:
+    return AuthUser(
+        id=user.id,
+        role=user.role,
+        login_id=get_user_login_id(user),
+        name=user.name,
+    )
+
+
+def build_route_access(db: Session, user: User) -> dict[str, Any]:
+    route_access: dict[str, Any] = {
+        "student_course_codes": [],
+        "professor_course_codes": [],
+        "can_view_admin_report": user.role == "admin",
+    }
+    login_id = get_user_login_id(user)
+    if user.role == "student":
+        route_access["student_course_codes"] = [course["course_code"] for course in list_student_courses(db, login_id)]
+    elif user.role == "professor":
+        route_access["professor_course_codes"] = [course["course_code"] for course in list_professor_courses(db, login_id)]
+    return route_access
+
+
+def set_refresh_cookie(response: Response, refresh_token: str, refresh_expires_at: datetime) -> None:
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=refresh_token,
+        httponly=True,
+        secure=settings.refresh_cookie_secure,
+        samesite=settings.refresh_cookie_samesite,
+        path=settings.refresh_cookie_path,
+        domain=settings.refresh_cookie_domain,
+        max_age=settings.refresh_token_ttl_seconds,
+        expires=refresh_expires_at,
+    )
+
+
+def clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.refresh_cookie_name,
+        path=settings.refresh_cookie_path,
+        domain=settings.refresh_cookie_domain,
+    )
+
+
+def build_auth_session_payload(db: Session, bundle: RefreshRotationBundle | None, user: User, access_token: str, access_expires_at: datetime | None) -> dict[str, Any]:
+    payload = {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_at": access_expires_at.isoformat() if access_expires_at else None,
+        "user": serialize_auth_user(user).model_dump(),
+        "route_access": build_route_access(db, user),
+    }
+    if bundle is not None:
+        payload["refresh_expires_at"] = bundle.refresh_expires_at.isoformat()
+    return payload
+
+
 def parse_bearer_login_id(authorization: str | None) -> str:
     if not authorization:
         raise api_error(
@@ -98,32 +275,30 @@ def parse_bearer_login_id(authorization: str | None) -> str:
         )
 
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token.startswith("dev-token:"):
+    if scheme.lower() != "bearer" or not token:
         raise api_error(
             status.HTTP_401_UNAUTHORIZED,
             "UNAUTHENTICATED",
             "invalid access token",
         )
-
-    login_id = token.removeprefix("dev-token:").strip()
-    if not login_id:
-        raise api_error(
-            status.HTTP_401_UNAUTHORIZED,
-            "UNAUTHENTICATED",
-            "invalid access token",
-        )
-    return login_id
+    return verify_access_token(token).login_id
 
 
 def require_authenticated_user(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> User:
-    login_id = parse_bearer_login_id(authorization)
     try:
+        login_id = parse_bearer_login_id(authorization)
         return get_user_by_login_id(db, login_id)
     except HTTPException as exc:
-        raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "invalid access token") from exc
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raise api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            detail.get("code", "UNAUTHENTICATED"),
+            detail.get("message", "invalid access token"),
+            detail.get("details", {}),
+        ) from exc
 
 
 def require_admin_role(current_user: User = Depends(require_authenticated_user)) -> User:
@@ -152,6 +327,74 @@ def require_professor_self(professor_id: str, current_user: User) -> None:
         )
 
 
+def require_professor_course_ownership(
+    professor_id: str,
+    course_code: str,
+    current_user: User,
+    db: Session,
+) -> tuple[User, Course]:
+    require_professor_self(professor_id, current_user)
+    return get_owned_course(db, professor_id, course_code)
+
+
+def require_student_course_access(
+    student_id: str,
+    course_code: str,
+    current_user: User,
+    db: Session,
+) -> tuple[User, Course]:
+    require_student_self(student_id, current_user)
+    student = get_student_user(db, student_id)
+    course = get_course_by_code(db, course_code)
+    ensure_student_enrolled(db, student.id, course.id, student_id, course_code)
+    return student, course
+
+
+def require_professor_route_bootstrap_access(
+    professor_id: str,
+    course_code: str,
+    current_user: User,
+    db: Session,
+) -> tuple[User, Course]:
+    require_professor_self(professor_id, current_user)
+    try:
+        return get_owned_course(db, professor_id, course_code)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raise api_error(
+            status.HTTP_403_FORBIDDEN,
+            "COURSE_ROUTE_FORBIDDEN",
+            "course route is not allowed",
+            {"course_code": course_code, "reason": detail.get("code", "FORBIDDEN")},
+        ) from exc
+
+
+def require_student_route_bootstrap_access(
+    student_id: str,
+    course_code: str,
+    current_user: User,
+    db: Session,
+) -> tuple[User, Course]:
+    require_student_self(student_id, current_user)
+    student = get_student_user(db, student_id)
+    course = get_course_by_code(db, course_code)
+    enrolled = db.scalar(
+        select(CourseEnrollment.id).where(
+            CourseEnrollment.course_id == course.id,
+            CourseEnrollment.student_user_id == student.id,
+            CourseEnrollment.status == "active",
+        )
+    )
+    if enrolled is None:
+        raise api_error(
+            status.HTTP_403_FORBIDDEN,
+            "COURSE_ROUTE_FORBIDDEN",
+            "course route is not allowed",
+            {"course_code": course_code, "student_id": student_id},
+        )
+    return student, course
+
+
 def require_login_match(requested_login_id: str, current_user: User) -> None:
     if get_user_login_id(current_user) != requested_login_id:
         raise api_error(
@@ -160,6 +403,23 @@ def require_login_match(requested_login_id: str, current_user: User) -> None:
             "requested user does not match the authenticated user",
             {"requested_login_id": requested_login_id},
         )
+
+
+def validate_attendance_socket_access(db: Session, user: User, course_code: str, view: str) -> None:
+    if user.role == "student":
+        student = get_student_user(db, get_user_login_id(user))
+        course = get_course_by_code(db, course_code)
+        ensure_student_enrolled(db, student.id, course.id, get_user_login_id(user), course_code)
+        return
+
+    if user.role == "professor":
+        _, _ = get_owned_course(db, get_user_login_id(user), course_code)
+        return
+
+    if user.role == "admin" and view == "report":
+        return
+
+    raise api_error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "websocket subscription is not allowed")
 
 
 def map_presence_snapshot(snapshot_payload: dict, db: Session) -> dict:
@@ -247,18 +507,142 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.post("/api/auth/login", response_model=AuthLoginResponse)
-def login(payload: AuthLoginRequest, db: Session = Depends(get_db)) -> AuthLoginResponse:
-    user = authenticate_user(db, payload.login_id, payload.password)
-    return AuthLoginResponse(
-        access_token=f"dev-token:{get_user_login_id(user)}",
-        user=AuthUser(
-            id=user.id,
-            role=user.role,
-            login_id=get_user_login_id(user),
-            name=user.name,
-        ),
-    )
+@app.post("/api/auth/login", response_model=None)
+def login(
+    payload: AuthLoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any] | JSONResponse:
+    try:
+        user = authenticate_user(db, payload.login_id, payload.password)
+        bundle = create_login_session(db, user)
+        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
+        auth_payload = build_auth_session_payload(
+            db,
+            bundle,
+            user,
+            bundle.access_token,
+            bundle.access_expires_at,
+        )
+        return success_payload(
+            auth_payload,
+            meta={
+                "refresh_cookie_name": settings.refresh_cookie_name,
+                "legacy_dev_token_enabled": settings.auth_allow_legacy_dev_tokens,
+            },
+            compatibility={
+                "access_token": bundle.access_token,
+                "user": auth_payload["user"],
+            },
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return error_payload(
+            exc.status_code,
+            detail.get("code", "UNAUTHENTICATED"),
+            detail.get("message", "invalid credentials"),
+            detail.get("details", {"login_id": payload.login_id}),
+        )
+
+
+@app.post("/api/auth/refresh", response_model=None)
+def refresh_auth_session(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any] | JSONResponse:
+    raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
+    if not raw_refresh_token:
+        return error_payload(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "refresh token is required")
+    try:
+        bundle = rotate_refresh_session(db, raw_refresh_token)
+        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
+        return success_payload(
+            build_auth_session_payload(
+                db,
+                bundle,
+                bundle.user,
+                bundle.access_token,
+                bundle.access_expires_at,
+            ),
+            meta={"refreshed": True},
+        )
+    except HTTPException as exc:
+        clear_refresh_cookie(response)
+        return error_response_from_exception(exc)
+
+
+def _bootstrap_auth_session(
+    request: Request,
+    response: Response,
+    db: Session,
+) -> dict[str, Any] | JSONResponse:
+    authorization = request.headers.get("Authorization")
+    if authorization:
+        try:
+            identity = verify_access_token(authorization.partition(" ")[2] if " " in authorization else authorization)
+            user = get_user_by_login_id(db, identity.login_id)
+            access_token = authorization.partition(" ")[2] if " " in authorization else authorization
+            return success_payload(
+                build_auth_session_payload(db, None, user, access_token, identity.expires_at),
+                meta={
+                    "restored_via": "access-token",
+                    "legacy_dev_token": identity.legacy_dev_token,
+                },
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if detail.get("code") not in {"TOKEN_EXPIRED", "UNAUTHENTICATED"}:
+                return error_response_from_exception(exc)
+
+    raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
+    if not raw_refresh_token:
+        return error_payload(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
+    try:
+        bundle = rotate_refresh_session(db, raw_refresh_token)
+        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
+        return success_payload(
+            build_auth_session_payload(
+                db,
+                bundle,
+                bundle.user,
+                bundle.access_token,
+                bundle.access_expires_at,
+            ),
+            meta={"restored_via": "refresh-cookie"},
+        )
+    except HTTPException as exc:
+        clear_refresh_cookie(response)
+        return error_response_from_exception(exc)
+
+
+@app.get("/api/auth/bootstrap", response_model=None)
+def bootstrap_auth_session(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any] | JSONResponse:
+    return _bootstrap_auth_session(request, response, db)
+
+
+@app.get("/api/auth/me", response_model=None)
+def bootstrap_auth_session_alias(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any] | JSONResponse:
+    return _bootstrap_auth_session(request, response, db)
+
+
+@app.post("/api/auth/logout")
+def logout_auth_session(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    revoke_refresh_session(db, request.cookies.get(settings.refresh_cookie_name))
+    clear_refresh_cookie(response)
+    return success_payload({"logged_out": True}, meta={"refresh_cookie_cleared": True})
 
 
 @app.get("/api/students/{student_id}/courses", response_model=list[CourseRead])
@@ -279,6 +663,75 @@ def get_professor_courses(
 ) -> list[CourseRead]:
     require_professor_self(professor_id, current_user)
     return [CourseRead(**course) for course in list_professor_courses(db, professor_id)]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/attendance/bootstrap")
+async def student_attendance_bootstrap(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student, course = require_student_route_bootstrap_access(student_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=[event["projection_key"]],
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return success_payload(
+        {
+            "user": serialize_auth_user(student).model_dump(),
+            "course": CourseRead(
+                id=course.id,
+                course_code=course.course_code,
+                title=course.title,
+            ).model_dump(),
+            "attendance": list_student_active_attendance_sessions(db, presence_client, student_id, course_code),
+        },
+        meta={"route": "student-attendance-bootstrap"},
+    )
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/bootstrap")
+async def professor_attendance_bootstrap(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    professor, course = require_professor_route_bootstrap_access(professor_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=[event["projection_key"]],
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    timeline = build_attendance_timeline(db, professor_id, course_code)
+    return success_payload(
+        {
+            "user": serialize_auth_user(professor).model_dump(),
+            "course": CourseRead(
+                id=course.id,
+                course_code=course.course_code,
+                title=course.title,
+            ).model_dump(),
+            "attendance": timeline,
+        },
+        meta={"route": "professor-attendance-bootstrap"},
+    )
 
 
 @app.get("/api/notices/{login_id}", response_model=NoticeListResponse)
@@ -465,3 +918,250 @@ def attendance_eligibility(
         purpose="attendance",
     )
     return AttendanceEligibilityResponse(**result)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/timeline")
+async def professor_attendance_timeline(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=[event["projection_key"]],
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return build_attendance_timeline(db, professor_id, course_code)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/report")
+async def professor_attendance_report(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=[event["projection_key"]],
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return build_attendance_report(db, professor_id, course_code)
+
+
+@app.post("/api/professors/{professor_id}/courses/{course_code}/attendance/sessions/batch")
+async def professor_open_attendance_sessions_batch(
+    professor_id: str,
+    course_code: str,
+    payload: AttendanceSessionBatchRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    result = open_attendance_sessions_batch(
+        db,
+        professor_id,
+        course_code,
+        projection_keys=payload.projection_keys,
+        mode=payload.mode,
+    )
+    await attendance_broker.publish(
+        course_code,
+        attendance_event_payload(
+            event_type="attendance.session.batch_applied",
+            course_code=course_code,
+            projection_keys=result["changed_projection_keys"],
+            session_ids=result["changed_session_ids"],
+            changed_payload={"results": result["results"], "mode": payload.mode},
+        ),
+    )
+    return result
+
+
+@app.post("/api/professors/{professor_id}/attendance/sessions/{session_id}/close")
+async def professor_close_attendance(
+    professor_id: str,
+    session_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_self(professor_id, current_user)
+    result = close_attendance_session(db, professor_id, session_id)
+    if "course_code" in result:
+        await attendance_broker.publish(
+            result["course_code"],
+            attendance_event_payload(
+                event_type="attendance.session.closed",
+                course_code=result["course_code"],
+                projection_keys=[result["projection_key"]],
+                session_ids=[result["session_id"]],
+                version=result["version"],
+            ),
+        )
+    return result
+
+
+@app.get("/api/professors/{professor_id}/attendance/sessions/{session_id}/roster")
+def professor_attendance_roster(
+    professor_id: str,
+    session_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_self(professor_id, current_user)
+    return get_attendance_session_roster(db, professor_id, session_id)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/slot-roster")
+def professor_attendance_slot_roster(
+    professor_id: str,
+    course_code: str,
+    projection_key: str = Query(...),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return get_attendance_slot_roster_preview(db, professor_id, course_code, projection_key)
+
+
+@app.patch("/api/professors/{professor_id}/attendance/sessions/{session_id}/students/{student_id}")
+async def professor_update_attendance_record(
+    professor_id: str,
+    session_id: int,
+    student_id: str,
+    payload: AttendanceRecordUpdateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_self(professor_id, current_user)
+    result = update_attendance_session_record(db, professor_id, session_id, student_id, payload.status, payload.reason)
+    await attendance_broker.publish(
+        result["course_code"],
+        attendance_event_payload(
+            event_type="attendance.record.updated",
+            course_code=result["course_code"],
+            projection_keys=[result["projection_key"]],
+            session_ids=[result["session_id"]],
+            version=result["version"],
+            changed_payload={"student_id": result["student_id"], "new_status": result["new_status"]},
+        ),
+    )
+    return result
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/students/{student_id}/history")
+def professor_attendance_student_history(
+    professor_id: str,
+    course_code: str,
+    student_id: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return list_attendance_history(db, professor_id, course_code, student_id)
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/attendance/active-sessions")
+async def student_active_attendance_sessions(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_student_course_access(student_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=[event["projection_key"]],
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return list_student_active_attendance_sessions(db, presence_client, student_id, course_code)
+
+
+@app.post("/api/students/{student_id}/attendance/sessions/{session_id}/check-in")
+async def student_attendance_check_in_endpoint(
+    student_id: str,
+    session_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_student_self(student_id, current_user)
+    result = student_attendance_check_in(db, presence_client, student_id, session_id)
+    await attendance_broker.publish(
+        result["course_code"],
+        attendance_event_payload(
+            event_type="attendance.student.checked_in",
+            course_code=result["course_code"],
+            projection_keys=[result["projection_key"]],
+            session_ids=[result["session_id"]],
+            version=result["version"],
+            changed_payload={"student_id": result["student_id"], "status": result["status"], "idempotent": result["idempotent"]},
+        ),
+    )
+    return result
+
+
+@app.websocket("/ws/attendance")
+async def attendance_websocket(
+    websocket: WebSocket,
+    token: str = Query(...),
+    courseCode: str = Query(...),
+    view: str = Query(default="professor"),
+) -> None:
+    db = SessionLocal()
+    try:
+        login_id = parse_bearer_login_id(f"Bearer {token}")
+        user = get_user_by_login_id(db, login_id)
+        validate_attendance_socket_access(db, user, courseCode, view)
+        await attendance_broker.connect(
+            courseCode,
+            websocket,
+            {"login_id": login_id, "role": user.role, "view": view, "course_code": courseCode},
+        )
+        if user.role == "student":
+            bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, courseCode)
+        elif user.role == "admin":
+            course = get_course_by_code(db, courseCode)
+            owner = db.scalar(select(User).where(User.id == course.professor_user_id))
+            bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", courseCode)
+        else:
+            bootstrap_data = build_attendance_timeline(db, user.professor_id or login_id, courseCode)
+        await websocket.send_json(
+            attendance_event_payload(
+                event_type="attendance.bootstrap",
+                course_code=courseCode,
+                changed_payload={"view": view, "data": bootstrap_data},
+            )
+        )
+        while True:
+            await websocket.receive_text()
+    except HTTPException:
+        await websocket.close(code=1008)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        attendance_broker.disconnect(courseCode, websocket)
+        db.close()
