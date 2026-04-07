@@ -277,6 +277,10 @@ def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
     assert payload["data"]["access_token"].count(".") == 2
     assert payload["access_token"] == payload["data"]["access_token"]
     assert login.cookies.get("smartclass_refresh")
+    set_cookie = login.headers.get("set-cookie", "")
+    assert "HttpOnly" in set_cookie
+    assert "Path=/api/auth" in set_cookie
+    assert "SameSite=lax" in set_cookie
 
     bootstrap = client.get("/api/auth/bootstrap")
     assert bootstrap.status_code == 200
@@ -303,6 +307,20 @@ def test_refresh_rotates_cookie_and_rejects_replay() -> None:
     replay = client.post("/api/auth/refresh")
     assert replay.status_code == 401
     assert replay.json()["error"]["code"] == "REFRESH_REPLAY_DETECTED"
+
+
+def test_local_dev_cors_allows_credentials_for_auth_routes() -> None:
+    client, _ = make_client()
+    response = client.options(
+        "/api/auth/refresh",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert response.headers["access-control-allow-credentials"] == "true"
 
 
 def test_logout_revokes_cookie_backed_restore() -> None:
@@ -338,6 +356,16 @@ def test_expired_access_token_returns_stable_code() -> None:
     )
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "TOKEN_EXPIRED"
+
+
+def test_invalid_access_token_returns_stable_unauthenticated_code() -> None:
+    client, _ = make_client()
+    response = client.get(
+        "/api/students/20201239/courses",
+        headers={"Authorization": "Bearer not-a-valid-token"},
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
 
 
 def test_attendance_bootstrap_rejects_unauthorized_course_routes() -> None:
