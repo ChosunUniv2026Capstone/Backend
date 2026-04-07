@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -157,6 +157,73 @@ def seed_backend_state(session: Session) -> None:
     session.add_all([network, device, enrollment, schedule])
 
 
+def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
+    client, _ = make_client()
+    response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
+    assert response.status_code == 200
+    payload = response.json()
+    option = next(item for item in payload["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
+    assert option["studentLoginId"] == "20201239"
+    assert option["deviceLabel"] == "Choi Phone"
+
+
+def test_generic_attendance_eligibility_returns_outside_window_when_no_active_schedule() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
+        schedule.day_of_week = (datetime.now().weekday() + 1) % 7
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
+
+
+def test_resolve_active_classroom_conflict_returns_not_eligible() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        db.add(Classroom(classroom_code="B102", name="Other", building="Main", floor_label="2F"))
+        db.flush()
+        course = db.scalar(select(Course).where(Course.course_code == "CSE116"))
+        classroom = db.scalar(select(Classroom).where(Classroom.classroom_code == "B102"))
+        now = datetime.now()
+        db.add(
+            CourseSchedule(
+                course_id=course.id,
+                classroom_id=classroom.id,
+                day_of_week=now.weekday(),
+                starts_at=(now - timedelta(minutes=30)).time().replace(microsecond=0),
+                ends_at=(now + timedelta(minutes=30)).time().replace(microsecond=0),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "CLASSROOM_CONFLICT"
+
+
 def auth_header(login_id: str) -> dict[str, str]:
     return {"Authorization": f"Bearer dev-token:{login_id}"}
 
@@ -233,9 +300,7 @@ def test_generic_attendance_eligibility_requires_student_self() -> None:
         headers=auth_header("ADM001"),
         json={
             "student_id": "20201239",
-            "course_id": "CSE116",
-            "classroom_id": "B101",
-            "purpose": "attendance",
+            "course_code": "CSE116",
         },
     )
     assert forbidden.status_code == 403
@@ -245,9 +310,7 @@ def test_generic_attendance_eligibility_requires_student_self() -> None:
         headers=auth_header("20201239"),
         json={
             "student_id": "20201239",
-            "course_id": "CSE116",
-            "classroom_id": "B101",
-            "purpose": "attendance",
+            "course_code": "CSE116",
         },
     )
     assert allowed.status_code == 200
@@ -262,8 +325,7 @@ def test_generic_attendance_eligibility_resolves_classroom_from_course_mapping()
         headers=auth_header("20201239"),
         json={
             "student_id": "20201239",
-            "course_id": "CSE116",
-            "purpose": "attendance",
+            "course_code": "CSE116",
         },
     )
     assert response.status_code == 200

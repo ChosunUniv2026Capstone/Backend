@@ -460,8 +460,8 @@ def attendance_eligibility(
         db=db,
         presence_client=presence_client,
         student_id=payload.student_id,
-        course_id=payload.course_id,
-        classroom_id=payload.classroom_id,
-        purpose=payload.purpose,
+        course_id=payload.course_code,
+        classroom_id=None,
+        purpose="attendance",
     )
     return AttendanceEligibilityResponse(**result)

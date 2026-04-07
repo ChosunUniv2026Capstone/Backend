@@ -105,9 +105,7 @@ class DeviceRead(BaseModel):
 
 class AttendanceEligibilityRequest(BaseModel):
     student_id: str
-    course_id: str
-    classroom_id: str | None = None
-    purpose: str = Field(default="attendance")
+    course_code: str
 
 
 class AttendanceEligibilityResponse(BaseModel):
