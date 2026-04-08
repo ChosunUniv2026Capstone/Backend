@@ -119,12 +119,28 @@ class AttendanceSession(Base):
     )
 
 
-class AttendanceRecord(Base):
-    __tablename__ = "attendance_records"
-    __table_args__ = (UniqueConstraint("attendance_session_id", "student_user_id"),)
+class AttendanceSessionSlot(Base):
+    __tablename__ = "attendance_session_slots"
+    __table_args__ = (UniqueConstraint("attendance_session_id", "projection_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
+    projection_key: Mapped[str] = mapped_column(String(255), index=True)
+    classroom_id: Mapped[int] = mapped_column(ForeignKey("classrooms.id"), index=True)
+    session_date: Mapped[datetime.date] = mapped_column(Date)
+    slot_start_at: Mapped[time] = mapped_column(Time)
+    slot_end_at: Mapped[time] = mapped_column(Time)
+    slot_order: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AttendanceRecord(Base):
+    __tablename__ = "attendance_records"
+    __table_args__ = (UniqueConstraint("attendance_session_id", "projection_key", "student_user_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
+    projection_key: Mapped[str] = mapped_column(String(255), index=True)
     student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     final_status: Mapped[str] = mapped_column(String(16))
     attendance_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -143,6 +159,7 @@ class AttendanceStatusAuditLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
+    projection_key: Mapped[str] = mapped_column(String(255), index=True)
     student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     actor_role: Mapped[str] = mapped_column(String(16))

@@ -245,12 +245,60 @@ def set_refresh_cookie(response: Response, refresh_token: str, refresh_expires_a
     )
 
 
+def set_access_cookie(response: Response, access_token: str, access_expires_at: datetime | None) -> None:
+    response.set_cookie(
+        key=settings.access_cookie_name,
+        value=access_token,
+        httponly=True,
+        secure=settings.access_cookie_secure,
+        samesite=settings.access_cookie_samesite,
+        path=settings.access_cookie_path,
+        domain=settings.access_cookie_domain,
+        max_age=settings.access_token_ttl_seconds,
+        expires=access_expires_at,
+    )
+
+
 def clear_refresh_cookie(response: Response) -> None:
     response.delete_cookie(
         key=settings.refresh_cookie_name,
         path=settings.refresh_cookie_path,
         domain=settings.refresh_cookie_domain,
     )
+
+
+def clear_access_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.access_cookie_name,
+        path=settings.access_cookie_path,
+        domain=settings.access_cookie_domain,
+    )
+
+
+def auth_success_response(
+    data: dict[str, Any],
+    *,
+    message: str = "ok",
+    meta: dict[str, Any] | None = None,
+    compatibility: dict[str, Any] | None = None,
+    access_token: str | None = None,
+    access_expires_at: datetime | None = None,
+    refresh_token: str | None = None,
+    refresh_expires_at: datetime | None = None,
+) -> JSONResponse:
+    response = JSONResponse(
+        content=success_payload(
+            data,
+            message=message,
+            meta=meta,
+            compatibility=compatibility,
+        )
+    )
+    if access_token and access_expires_at:
+        set_access_cookie(response, access_token, access_expires_at)
+    if refresh_token and refresh_expires_at:
+        set_refresh_cookie(response, refresh_token, refresh_expires_at)
+    return response
 
 
 def build_auth_session_payload(db: Session, bundle: RefreshRotationBundle | None, user: User, access_token: str, access_expires_at: datetime | None) -> dict[str, Any]:
@@ -285,11 +333,22 @@ def parse_bearer_login_id(authorization: str | None) -> str:
 
 
 def require_authenticated_user(
+    request: Request,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> User:
     try:
-        login_id = parse_bearer_login_id(authorization)
+        if authorization:
+            login_id = parse_bearer_login_id(authorization)
+        else:
+            raw_access_cookie = request.cookies.get(settings.access_cookie_name)
+            if not raw_access_cookie:
+                raise api_error(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "UNAUTHENTICATED",
+                    "authentication is required",
+                )
+            login_id = verify_access_token(raw_access_cookie).login_id
         return get_user_by_login_id(db, login_id)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -510,13 +569,11 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
 @app.post("/api/auth/login", response_model=None)
 def login(
     payload: AuthLoginRequest,
-    response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any] | JSONResponse:
     try:
         user = authenticate_user(db, payload.login_id, payload.password)
         bundle = create_login_session(db, user)
-        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
         auth_payload = build_auth_session_payload(
             db,
             bundle,
@@ -524,16 +581,21 @@ def login(
             bundle.access_token,
             bundle.access_expires_at,
         )
-        return success_payload(
+        return auth_success_response(
             auth_payload,
             meta={
                 "refresh_cookie_name": settings.refresh_cookie_name,
+                "access_cookie_name": settings.access_cookie_name,
                 "legacy_dev_token_enabled": settings.auth_allow_legacy_dev_tokens,
             },
             compatibility={
                 "access_token": bundle.access_token,
                 "user": auth_payload["user"],
             },
+            access_token=bundle.access_token,
+            access_expires_at=bundle.access_expires_at,
+            refresh_token=bundle.refresh_token,
+            refresh_expires_at=bundle.refresh_expires_at,
         )
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -548,7 +610,6 @@ def login(
 @app.post("/api/auth/refresh", response_model=None)
 def refresh_auth_session(
     request: Request,
-    response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any] | JSONResponse:
     raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
@@ -556,8 +617,7 @@ def refresh_auth_session(
         return error_payload(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "refresh token is required")
     try:
         bundle = rotate_refresh_session(db, raw_refresh_token)
-        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
-        return success_payload(
+        return auth_success_response(
             build_auth_session_payload(
                 db,
                 bundle,
@@ -566,15 +626,20 @@ def refresh_auth_session(
                 bundle.access_expires_at,
             ),
             meta={"refreshed": True},
+            access_token=bundle.access_token,
+            access_expires_at=bundle.access_expires_at,
+            refresh_token=bundle.refresh_token,
+            refresh_expires_at=bundle.refresh_expires_at,
         )
     except HTTPException as exc:
-        clear_refresh_cookie(response)
-        return error_response_from_exception(exc)
+        error_response = error_response_from_exception(exc)
+        clear_access_cookie(error_response)
+        clear_refresh_cookie(error_response)
+        return error_response
 
 
 def _bootstrap_auth_session(
     request: Request,
-    response: Response,
     db: Session,
 ) -> dict[str, Any] | JSONResponse:
     authorization = request.headers.get("Authorization")
@@ -583,7 +648,7 @@ def _bootstrap_auth_session(
             identity = verify_access_token(authorization.partition(" ")[2] if " " in authorization else authorization)
             user = get_user_by_login_id(db, identity.login_id)
             access_token = authorization.partition(" ")[2] if " " in authorization else authorization
-            return success_payload(
+            return auth_success_response(
                 build_auth_session_payload(db, None, user, access_token, identity.expires_at),
                 meta={
                     "restored_via": "access-token",
@@ -595,13 +660,26 @@ def _bootstrap_auth_session(
             if detail.get("code") not in {"TOKEN_EXPIRED", "UNAUTHENTICATED"}:
                 return error_response_from_exception(exc)
 
+    raw_access_cookie = request.cookies.get(settings.access_cookie_name)
+    if raw_access_cookie:
+        try:
+            identity = verify_access_token(raw_access_cookie)
+            user = get_user_by_login_id(db, identity.login_id)
+            return auth_success_response(
+                build_auth_session_payload(db, None, user, raw_access_cookie, identity.expires_at),
+                meta={"restored_via": "access-cookie"},
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if detail.get("code") not in {"TOKEN_EXPIRED", "UNAUTHENTICATED"}:
+                return error_response_from_exception(exc)
+
     raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
     if not raw_refresh_token:
         return error_payload(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
     try:
         bundle = rotate_refresh_session(db, raw_refresh_token)
-        set_refresh_cookie(response, bundle.refresh_token, bundle.refresh_expires_at)
-        return success_payload(
+        return auth_success_response(
             build_auth_session_payload(
                 db,
                 bundle,
@@ -610,39 +688,44 @@ def _bootstrap_auth_session(
                 bundle.access_expires_at,
             ),
             meta={"restored_via": "refresh-cookie"},
+            access_token=bundle.access_token,
+            access_expires_at=bundle.access_expires_at,
+            refresh_token=bundle.refresh_token,
+            refresh_expires_at=bundle.refresh_expires_at,
         )
     except HTTPException as exc:
-        clear_refresh_cookie(response)
-        return error_response_from_exception(exc)
+        error_response = error_response_from_exception(exc)
+        clear_access_cookie(error_response)
+        clear_refresh_cookie(error_response)
+        return error_response
 
 
 @app.get("/api/auth/bootstrap", response_model=None)
 def bootstrap_auth_session(
     request: Request,
-    response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any] | JSONResponse:
-    return _bootstrap_auth_session(request, response, db)
+    return _bootstrap_auth_session(request, db)
 
 
 @app.get("/api/auth/me", response_model=None)
 def bootstrap_auth_session_alias(
     request: Request,
-    response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any] | JSONResponse:
-    return _bootstrap_auth_session(request, response, db)
+    return _bootstrap_auth_session(request, db)
 
 
 @app.post("/api/auth/logout")
 def logout_auth_session(
     request: Request,
-    response: Response,
     db: Session = Depends(get_db),
-) -> dict[str, Any]:
+) -> JSONResponse:
     revoke_refresh_session(db, request.cookies.get(settings.refresh_cookie_name))
+    response = JSONResponse(content=success_payload({"logged_out": True}, meta={"refresh_cookie_cleared": True}))
+    clear_access_cookie(response)
     clear_refresh_cookie(response)
-    return success_payload({"logged_out": True}, meta={"refresh_cookie_cleared": True})
+    return response
 
 
 @app.get("/api/students/{student_id}/courses", response_model=list[CourseRead])
@@ -680,7 +763,7 @@ async def student_attendance_bootstrap(
             attendance_event_payload(
                 event_type=event["event_type"],
                 course_code=event["course_code"],
-                projection_keys=[event["projection_key"]],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
@@ -714,7 +797,7 @@ async def professor_attendance_bootstrap(
             attendance_event_payload(
                 event_type=event["event_type"],
                 course_code=event["course_code"],
-                projection_keys=[event["projection_key"]],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
@@ -935,7 +1018,7 @@ async def professor_attendance_timeline(
             attendance_event_payload(
                 event_type=event["event_type"],
                 course_code=event["course_code"],
-                projection_keys=[event["projection_key"]],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
@@ -958,7 +1041,7 @@ async def professor_attendance_report(
             attendance_event_payload(
                 event_type=event["event_type"],
                 course_code=event["course_code"],
-                projection_keys=[event["projection_key"]],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
@@ -1010,7 +1093,7 @@ async def professor_close_attendance(
             attendance_event_payload(
                 event_type="attendance.session.closed",
                 course_code=result["course_code"],
-                projection_keys=[result["projection_key"]],
+                projection_keys=result.get("projection_keys", [result["projection_key"]]),
                 session_ids=[result["session_id"]],
                 version=result["version"],
             ),
@@ -1051,18 +1134,31 @@ async def professor_update_attendance_record(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_professor_self(professor_id, current_user)
-    result = update_attendance_session_record(db, professor_id, session_id, student_id, payload.status, payload.reason)
-    await attendance_broker.publish(
-        result["course_code"],
-        attendance_event_payload(
-            event_type="attendance.record.updated",
-            course_code=result["course_code"],
-            projection_keys=[result["projection_key"]],
-            session_ids=[result["session_id"]],
-            version=result["version"],
-            changed_payload={"student_id": result["student_id"], "new_status": result["new_status"]},
-        ),
+    result = update_attendance_session_record(
+        db,
+        professor_id,
+        session_id,
+        student_id,
+        payload.status,
+        payload.reason,
+        payload.projection_key,
     )
+    if result.get("changed", True):
+        await attendance_broker.publish(
+            result["course_code"],
+            attendance_event_payload(
+                event_type="attendance.record.updated",
+                course_code=result["course_code"],
+                projection_keys=result.get("projection_keys", [result["projection_key"]]),
+                session_ids=[result["session_id"]],
+                version=result["version"],
+                changed_payload={
+                    "student_id": result["student_id"],
+                    "new_status": result["new_status"],
+                    "projection_keys": result.get("projection_keys", []),
+                },
+            ),
+        )
     return result
 
 
@@ -1093,7 +1189,7 @@ async def student_active_attendance_sessions(
             attendance_event_payload(
                 event_type=event["event_type"],
                 course_code=event["course_code"],
-                projection_keys=[event["projection_key"]],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
@@ -1115,10 +1211,18 @@ async def student_attendance_check_in_endpoint(
         attendance_event_payload(
             event_type="attendance.student.checked_in",
             course_code=result["course_code"],
-            projection_keys=[result["projection_key"]],
+            projection_keys=result.get("projection_keys", [result["projection_key"]]),
             session_ids=[result["session_id"]],
             version=result["version"],
-            changed_payload={"student_id": result["student_id"], "status": result["status"], "idempotent": result["idempotent"]},
+            changed_payload={
+                "student_id": result["student_id"],
+                "status": result["status"],
+                "idempotent": result["idempotent"],
+                "changed_count": result.get("changed_count"),
+                "already_present_count": result.get("already_present_count"),
+                "rejected_count": result.get("rejected_count"),
+                "projection_keys": result.get("projection_keys", []),
+            },
         ),
     )
     return result
@@ -1127,14 +1231,22 @@ async def student_attendance_check_in_endpoint(
 @app.websocket("/ws/attendance")
 async def attendance_websocket(
     websocket: WebSocket,
-    token: str = Query(...),
+    token: str | None = Query(default=None),
     courseCode: str = Query(...),
     view: str = Query(default="professor"),
 ) -> None:
     db = SessionLocal()
     try:
-        login_id = parse_bearer_login_id(f"Bearer {token}")
-        user = get_user_by_login_id(db, login_id)
+        if token:
+            login_id = parse_bearer_login_id(f"Bearer {token}")
+            user = get_user_by_login_id(db, login_id)
+        else:
+            raw_access_cookie = websocket.cookies.get(settings.access_cookie_name)
+            if not raw_access_cookie:
+                raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
+            identity = verify_access_token(raw_access_cookie)
+            login_id = identity.login_id
+            user = get_user_by_login_id(db, login_id)
         validate_attendance_socket_access(db, user, courseCode, view)
         await attendance_broker.connect(
             courseCode,

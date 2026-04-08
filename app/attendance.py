@@ -6,12 +6,13 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
 from fastapi import HTTPException
-from sqlalchemy import Select, desc, func, select
+from sqlalchemy import Select, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
     AttendanceRecord,
     AttendanceSession,
+    AttendanceSessionSlot,
     AttendanceStatusAuditLog,
     Classroom,
     ClassroomNetwork,
@@ -50,6 +51,17 @@ class ProjectionSlot:
     display_label: str
     professor_name: str
     professor_login_id: str
+
+
+@dataclass(frozen=True)
+class SessionSlotAssignment:
+    attendance_session_id: int
+    projection_key: str
+    classroom_id: int
+    session_date: date
+    slot_start_at: time
+    slot_end_at: time
+    slot_order: int
 
 
 def attendance_api_error(status_code: int, code: str, message: str, details: dict[str, Any] | None = None) -> HTTPException:
@@ -229,6 +241,128 @@ def _serialize_time(value: time) -> str:
     return value.replace(microsecond=0).isoformat()
 
 
+def _fallback_session_assignment(session: AttendanceSession) -> SessionSlotAssignment:
+    return SessionSlotAssignment(
+        attendance_session_id=session.id,
+        projection_key=session.projection_key,
+        classroom_id=session.classroom_id,
+        session_date=session.session_date,
+        slot_start_at=session.slot_start_at,
+        slot_end_at=session.slot_end_at,
+        slot_order=0,
+    )
+
+
+def _session_slot_assignments(db: Session, sessions: list[AttendanceSession]) -> dict[int, list[SessionSlotAssignment]]:
+    if not sessions:
+        return {}
+
+    rows = db.scalars(
+        select(AttendanceSessionSlot)
+        .where(AttendanceSessionSlot.attendance_session_id.in_([session.id for session in sessions]))
+        .order_by(AttendanceSessionSlot.slot_order.asc(), AttendanceSessionSlot.id.asc())
+    ).all()
+
+    assignments: dict[int, list[SessionSlotAssignment]] = defaultdict(list)
+    for row in rows:
+        assignments[row.attendance_session_id].append(
+            SessionSlotAssignment(
+                attendance_session_id=row.attendance_session_id,
+                projection_key=row.projection_key,
+                classroom_id=row.classroom_id,
+                session_date=row.session_date,
+                slot_start_at=row.slot_start_at,
+                slot_end_at=row.slot_end_at,
+                slot_order=row.slot_order,
+            )
+        )
+
+    for session in sessions:
+        assignments.setdefault(session.id, [_fallback_session_assignment(session)])
+    return assignments
+
+
+def _session_assignments_for_one(db: Session, session: AttendanceSession) -> list[SessionSlotAssignment]:
+    return _session_slot_assignments(db, [session]).get(session.id, [_fallback_session_assignment(session)])
+
+
+def _serialize_assignment(slot_map: dict[str, ProjectionSlot], assignment: SessionSlotAssignment) -> dict[str, Any]:
+    slot = slot_map.get(assignment.projection_key)
+    return {
+        "projection_key": assignment.projection_key,
+        "classroom_code": slot.classroom_code if slot else None,
+        "session_date": _serialize_date(assignment.session_date),
+        "slot_start_at": _serialize_time(assignment.slot_start_at),
+        "slot_end_at": _serialize_time(assignment.slot_end_at),
+        "display_label": slot.display_label if slot else assignment.projection_key,
+        "period_label": slot.period_label if slot else None,
+        "slot_order": assignment.slot_order,
+    }
+
+
+def _assignment_from_projection_slot(classroom_id: int, slot: ProjectionSlot, *, slot_order: int = 0) -> SessionSlotAssignment:
+    return SessionSlotAssignment(
+        attendance_session_id=0,
+        projection_key=slot.projection_key,
+        classroom_id=classroom_id,
+        session_date=slot.session_date,
+        slot_start_at=slot.slot_start_at,
+        slot_end_at=slot.slot_end_at,
+        slot_order=slot_order,
+    )
+
+
+def _bundle_bounds(assignments: list[SessionSlotAssignment]) -> tuple[time, time]:
+    ordered = sorted(assignments, key=lambda item: (item.slot_start_at, item.slot_order))
+    return ordered[0].slot_start_at, max(item.slot_end_at for item in ordered)
+
+
+def _projection_lookup_by_session(
+    db: Session,
+    course_id: int,
+) -> tuple[dict[str, AttendanceSession], dict[int, list[SessionSlotAssignment]]]:
+    sessions = db.scalars(
+        select(AttendanceSession)
+        .where(AttendanceSession.course_id == course_id)
+        .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
+    ).all()
+    assignments_by_session = _session_slot_assignments(db, sessions)
+    latest: dict[str, AttendanceSession] = {}
+    for session in sessions:
+        for assignment in assignments_by_session.get(session.id, [_fallback_session_assignment(session)]):
+            latest.setdefault(assignment.projection_key, session)
+    return latest, assignments_by_session
+
+
+def _latest_session_for_projection(db: Session, projection_key: str) -> AttendanceSession | None:
+    sessions = db.scalars(
+        select(AttendanceSession)
+        .outerjoin(
+            AttendanceSessionSlot,
+            AttendanceSessionSlot.attendance_session_id == AttendanceSession.id,
+        )
+        .where(
+            (AttendanceSession.projection_key == projection_key)
+            | (AttendanceSessionSlot.projection_key == projection_key)
+        )
+        .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
+    ).all()
+    return sessions[0] if sessions else None
+
+
+def _record_counts_for_slots(db: Session, session_ids: list[int]) -> dict[tuple[int, str], dict[str, int]]:
+    counts: dict[tuple[int, str], dict[str, int]] = defaultdict(
+        lambda: {"present": 0, "late": 0, "absent": 0, "official": 0, "sick": 0}
+    )
+    if not session_ids:
+        return counts
+    records = db.scalars(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id.in_(session_ids))).all()
+    for record in records:
+        key = (record.attendance_session_id, record.projection_key)
+        counts[key][record.final_status] = counts[key].get(record.final_status, 0) + 1
+    return counts
+
+
 def expire_stale_attendance_sessions(db: Session, course_code: str | None = None) -> list[dict[str, Any]]:
     query: Select[tuple[AttendanceSession, Course]] = (
         select(AttendanceSession, Course)
@@ -245,6 +379,7 @@ def expire_stale_attendance_sessions(db: Session, course_code: str | None = None
     expired_events: list[dict[str, Any]] = []
     now = datetime.now(UTC)
     rows = db.execute(query).all()
+    assignments_by_session = _session_slot_assignments(db, [session for session, _ in rows])
     for session, course in rows:
         expires_at = _coerce_utc(session.expires_at)
         if expires_at is None or expires_at > now:
@@ -252,10 +387,12 @@ def expire_stale_attendance_sessions(db: Session, course_code: str | None = None
         session.status = "expired"
         session.closed_at = now.replace(tzinfo=None)
         session.latest_version += 1
+        projection_keys = [assignment.projection_key for assignment in assignments_by_session.get(session.id, [])]
         expired_events.append(
             {
                 "course_code": course.course_code,
                 "projection_key": session.projection_key,
+                "projection_keys": projection_keys or [session.projection_key],
                 "session_id": session.id,
                 "version": session.latest_version,
                 "event_type": "session.expired",
@@ -265,28 +402,6 @@ def expire_stale_attendance_sessions(db: Session, course_code: str | None = None
     if expired_events:
         db.commit()
     return expired_events
-
-
-def _latest_sessions_by_projection_key(db: Session, course_id: int) -> dict[str, AttendanceSession]:
-    sessions = db.scalars(
-        select(AttendanceSession)
-        .where(AttendanceSession.course_id == course_id)
-        .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
-    ).all()
-    latest: dict[str, AttendanceSession] = {}
-    for session in sessions:
-        latest.setdefault(session.projection_key, session)
-    return latest
-
-
-def _record_counts_for_sessions(db: Session, session_ids: list[int]) -> dict[int, dict[str, int]]:
-    counts: dict[int, dict[str, int]] = defaultdict(lambda: {"present": 0, "late": 0, "absent": 0, "official": 0, "sick": 0})
-    if not session_ids:
-        return counts
-    records = db.scalars(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id.in_(session_ids))).all()
-    for record in records:
-        counts[record.attendance_session_id][record.final_status] = counts[record.attendance_session_id].get(record.final_status, 0) + 1
-    return counts
 
 
 def _slot_state(session: AttendanceSession | None) -> str:
@@ -299,7 +414,28 @@ def _slot_state(session: AttendanceSession | None) -> str:
     return "offline"
 
 
-def _serialize_slot(slot: ProjectionSlot, session: AttendanceSession | None, counts: dict[str, int]) -> dict[str, Any]:
+
+def _counts_template() -> dict[str, int]:
+    return {"present": 0, "late": 0, "absent": 0, "official": 0, "sick": 0}
+
+
+
+def _projection_keys_for_session(
+    assignments_by_session: dict[int, list[SessionSlotAssignment]],
+    session: AttendanceSession | None,
+) -> list[str]:
+    if session is None:
+        return []
+    return [assignment.projection_key for assignment in assignments_by_session.get(session.id, [_fallback_session_assignment(session)])]
+
+
+
+def _serialize_slot(
+    slot: ProjectionSlot,
+    session: AttendanceSession | None,
+    counts: dict[str, int],
+    session_projection_keys: list[str],
+) -> dict[str, Any]:
     official_total = counts.get("official", 0) + counts.get("sick", 0)
     return {
         "projection_key": slot.projection_key,
@@ -319,6 +455,9 @@ def _serialize_slot(slot: ProjectionSlot, session: AttendanceSession | None, cou
         "session_mode": session.mode if session else None,
         "session_status": session.status if session else None,
         "expires_at": _serialize_dt(session.expires_at) if session else None,
+        "bundle_projection_keys": session_projection_keys,
+        "bundle_slot_count": len(session_projection_keys),
+        "is_anchor_slot": bool(session and session.projection_key == slot.projection_key),
         "aggregate": {
             "present": counts.get("present", 0),
             "late": counts.get("late", 0),
@@ -329,18 +468,20 @@ def _serialize_slot(slot: ProjectionSlot, session: AttendanceSession | None, cou
     }
 
 
+
 def build_attendance_timeline(db: Session, professor_id: str, course_code: str) -> dict[str, Any]:
     professor, course = get_owned_course(db, professor_id, course_code)
     expire_stale_attendance_sessions(db, course_code)
     slots = _projection_slot_rows(db, course, professor)
-    latest_sessions = _latest_sessions_by_projection_key(db, course.id)
-    counts_by_session = _record_counts_for_sessions(db, [session.id for session in latest_sessions.values()])
+    latest_sessions, assignments_by_session = _projection_lookup_by_session(db, course.id)
+    counts_by_slot = _record_counts_for_slots(db, [session.id for session in latest_sessions.values()])
 
     weeks: dict[int, dict[str, Any]] = {}
     for slot in slots:
         session = latest_sessions.get(slot.projection_key)
-        counts = counts_by_session.get(session.id if session else -1, {})
-        serialized = _serialize_slot(slot, session, counts)
+        session_projection_keys = _projection_keys_for_session(assignments_by_session, session)
+        counts = counts_by_slot.get((session.id, slot.projection_key), _counts_template()) if session else _counts_template()
+        serialized = _serialize_slot(slot, session, counts, session_projection_keys)
         week_start = slot.session_date - timedelta(days=slot.session_date.weekday())
         bucket = weeks.setdefault(
             slot.week_index,
@@ -364,11 +505,12 @@ def build_attendance_timeline(db: Session, professor_id: str, course_code: str) 
     }
 
 
+
 def build_attendance_report(db: Session, professor_id: str, course_code: str) -> dict[str, Any]:
     _, course = get_owned_course(db, professor_id, course_code)
     expire_stale_attendance_sessions(db, course_code)
-    latest_sessions = _latest_sessions_by_projection_key(db, course.id)
-    counts_by_session = _record_counts_for_sessions(db, [session.id for session in latest_sessions.values()])
+    latest_sessions, _ = _projection_lookup_by_session(db, course.id)
+    counts_by_slot = _record_counts_for_slots(db, [session.id for session in latest_sessions.values()])
 
     summary = {
         "projection_slot_count": len(latest_sessions),
@@ -381,29 +523,29 @@ def build_attendance_report(db: Session, professor_id: str, course_code: str) ->
         "official": 0,
         "sick": 0,
     }
-    for session in latest_sessions.values():
-        counts = counts_by_session.get(session.id, {})
+    active_session_ids: set[int] = set()
+    smart_session_ids: set[int] = set()
+    canceled_session_ids: set[int] = set()
+    for projection_key, session in latest_sessions.items():
+        counts = counts_by_slot.get((session.id, projection_key), _counts_template())
         if session.status == "active":
-            summary["active_session_count"] += 1
+            active_session_ids.add(session.id)
             if session.mode == "smart":
-                summary["smart_active_count"] += 1
+                smart_session_ids.add(session.id)
         if session.mode == "canceled" or session.status == "canceled":
-            summary["canceled_count"] += 1
+            canceled_session_ids.add(session.id)
         for key in ("present", "late", "absent", "official", "sick"):
             summary[key] += counts.get(key, 0)
+    summary["active_session_count"] = len(active_session_ids)
+    summary["smart_active_count"] = len(smart_session_ids)
+    summary["canceled_count"] = len(canceled_session_ids)
     return summary
+
 
 
 def _projection_slot_lookup(db: Session, course: Course, professor: User) -> dict[str, ProjectionSlot]:
     return {slot.projection_key: slot for slot in _projection_slot_rows(db, course, professor)}
 
-
-def _latest_session_for_projection(db: Session, projection_key: str) -> AttendanceSession | None:
-    return db.scalar(
-        select(AttendanceSession)
-        .where(AttendanceSession.projection_key == projection_key)
-        .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
-    )
 
 
 def open_attendance_sessions_batch(
@@ -419,12 +561,13 @@ def open_attendance_sessions_batch(
     professor, course = get_owned_course(db, professor_id, course_code)
     slot_map = _projection_slot_lookup(db, course, professor)
     now = _utcnow()
+    deduped_projection_keys = list(dict.fromkeys(projection_keys))
     results: list[dict[str, Any]] = []
-    changed_projection_keys: list[str] = []
-    changed_session_ids: list[int] = []
+    valid_assignments: list[SessionSlotAssignment] = []
     target_session_date: date | None = None
+    previous_sessions: dict[str, AttendanceSession | None] = {}
 
-    for projection_key in projection_keys:
+    for order, projection_key in enumerate(deduped_projection_keys):
         slot = slot_map.get(projection_key)
         if slot is None:
             results.append(
@@ -454,10 +597,16 @@ def open_attendance_sessions_batch(
             continue
 
         active_existing = db.scalar(
-            select(AttendanceSession).where(
-                AttendanceSession.projection_key == projection_key,
+            select(AttendanceSession)
+            .outerjoin(AttendanceSessionSlot, AttendanceSessionSlot.attendance_session_id == AttendanceSession.id)
+            .where(
                 AttendanceSession.status == "active",
+                or_(
+                    AttendanceSession.projection_key == projection_key,
+                    AttendanceSessionSlot.projection_key == projection_key,
+                ),
             )
+            .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
         )
         if active_existing is not None:
             results.append(
@@ -472,14 +621,43 @@ def open_attendance_sessions_batch(
             )
             continue
 
-        latest_previous = _latest_session_for_projection(db, projection_key)
+        classroom_id = db.scalar(select(Classroom.id).where(Classroom.classroom_code == slot.classroom_code))
+        if classroom_id is None:
+            results.append(
+                {
+                    "projection_key": projection_key,
+                    "success": False,
+                    "code": "SESSION_SLOT_INVALID",
+                    "message": "projection slot classroom is missing",
+                    "session_id": None,
+                    "resulting_slot_state": "unchecked",
+                }
+            )
+            continue
+
+        valid_assignments.append(
+            SessionSlotAssignment(
+                attendance_session_id=0,
+                projection_key=projection_key,
+                classroom_id=classroom_id,
+                session_date=slot.session_date,
+                slot_start_at=slot.slot_start_at,
+                slot_end_at=slot.slot_end_at,
+                slot_order=order,
+            )
+        )
+        previous_sessions[projection_key] = _latest_session_for_projection(db, projection_key)
+
+    if valid_assignments:
+        anchor = valid_assignments[0]
+        bundle_start_at, bundle_end_at = _bundle_bounds(valid_assignments)
         session = AttendanceSession(
-            projection_key=projection_key,
+            projection_key=anchor.projection_key,
             course_id=course.id,
-            classroom_id=db.scalar(select(Classroom.id).where(Classroom.classroom_code == slot.classroom_code)),
-            session_date=slot.session_date,
-            slot_start_at=slot.slot_start_at,
-            slot_end_at=slot.slot_end_at,
+            classroom_id=anchor.classroom_id,
+            session_date=anchor.session_date,
+            slot_start_at=bundle_start_at,
+            slot_end_at=bundle_end_at,
             mode=mode,
             status="canceled" if mode == "canceled" else "active",
             opened_by_user_id=professor.id,
@@ -490,33 +668,62 @@ def open_attendance_sessions_batch(
         )
         db.add(session)
         db.flush()
-        changed_projection_keys.append(projection_key)
-        changed_session_ids.append(session.id)
-        event_type = "session.reopened" if latest_previous is not None else "session.opened"
-        if mode == "canceled":
-            event_type = "session.canceled"
-        results.append(
-            {
-                "projection_key": projection_key,
+        for assignment in valid_assignments:
+            db.add(
+                AttendanceSessionSlot(
+                    attendance_session_id=session.id,
+                    projection_key=assignment.projection_key,
+                    classroom_id=assignment.classroom_id,
+                    session_date=assignment.session_date,
+                    slot_start_at=assignment.slot_start_at,
+                    slot_end_at=assignment.slot_end_at,
+                    slot_order=assignment.slot_order,
+                )
+            )
+
+        success_rows = {
+            assignment.projection_key: {
+                "projection_key": assignment.projection_key,
                 "success": True,
                 "code": "OK",
                 "message": "attendance session applied",
                 "session_id": session.id,
                 "resulting_slot_state": _slot_state(session),
-                "event_type": event_type,
+                "event_type": (
+                    "session.canceled"
+                    if mode == "canceled"
+                    else "session.reopened"
+                    if previous_sessions.get(assignment.projection_key) is not None
+                    else "session.opened"
+                ),
                 "expires_at": _serialize_dt(session.expires_at),
             }
-        )
+            for assignment in valid_assignments
+        }
+        final_results: list[dict[str, Any]] = []
+        for projection_key in deduped_projection_keys:
+            matching = next((row for row in results if row["projection_key"] == projection_key), None)
+            final_results.append(success_rows.get(projection_key, matching))
+        results = [row for row in final_results if row is not None]
+        db.commit()
+        return {
+            "course_code": course.course_code,
+            "mode": mode,
+            "results": results,
+            "changed_projection_keys": [assignment.projection_key for assignment in valid_assignments],
+            "changed_session_ids": [session.id],
+            "occurred_at": _serialize_dt(now),
+        }
 
-    db.commit()
     return {
         "course_code": course.course_code,
         "mode": mode,
         "results": results,
-        "changed_projection_keys": changed_projection_keys,
-        "changed_session_ids": changed_session_ids,
+        "changed_projection_keys": [],
+        "changed_session_ids": [],
         "occurred_at": _serialize_dt(now),
     }
+
 
 
 def close_attendance_session(db: Session, professor_id: str, session_id: int) -> dict[str, Any]:
@@ -527,10 +734,12 @@ def close_attendance_session(db: Session, professor_id: str, session_id: int) ->
     course = db.scalar(select(Course).where(Course.id == session.course_id))
     if course is None or course.professor_user_id != professor.id:
         raise attendance_api_error(403, "FORBIDDEN", "session does not belong to the authenticated professor")
+    projection_keys = _projection_keys_for_session({session.id: _session_assignments_for_one(db, session)}, session)
     if session.status != "active":
         return {
             "session_id": session.id,
             "projection_key": session.projection_key,
+            "projection_keys": projection_keys,
             "status": session.status,
             "version": session.latest_version,
             "occurred_at": _serialize_dt(_utcnow()),
@@ -543,11 +752,72 @@ def close_attendance_session(db: Session, professor_id: str, session_id: int) ->
     return {
         "session_id": session.id,
         "projection_key": session.projection_key,
+        "projection_keys": projection_keys,
         "status": session.status,
         "version": session.latest_version,
         "occurred_at": _serialize_dt(session.closed_at),
         "course_code": course.course_code,
     }
+
+
+
+def _enrolled_students_for_course(db: Session, course_id: int) -> list[tuple[int, str, str]]:
+    return db.execute(
+        select(User.id, User.student_id, User.name)
+        .join(CourseEnrollment, CourseEnrollment.student_user_id == User.id)
+        .where(CourseEnrollment.course_id == course_id, CourseEnrollment.status == "active", User.role == "student")
+        .order_by(User.student_id.asc())
+    ).all()
+
+
+
+def _history_counts_for_course(db: Session, course_id: int) -> dict[int, int]:
+    return {
+        student_user_id: count
+        for student_user_id, count in db.execute(
+            select(AttendanceStatusAuditLog.student_user_id, func.count(AttendanceStatusAuditLog.id))
+            .join(AttendanceSession, AttendanceSession.id == AttendanceStatusAuditLog.attendance_session_id)
+            .where(AttendanceSession.course_id == course_id)
+            .group_by(AttendanceStatusAuditLog.student_user_id)
+        )
+    }
+
+
+
+def _records_for_session(db: Session, session_id: int) -> dict[tuple[int, str], AttendanceRecord]:
+    records = db.scalars(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id == session_id)).all()
+    return {(record.student_user_id, record.projection_key): record for record in records}
+
+
+
+def _aggregate_counts_for_assignments(
+    counts_by_slot: dict[tuple[int, str], dict[str, int]],
+    session_id: int,
+    assignments: list[SessionSlotAssignment],
+) -> dict[str, int]:
+    aggregate = _counts_template()
+    for assignment in assignments:
+        counts = counts_by_slot.get((session_id, assignment.projection_key), _counts_template())
+        for key, value in counts.items():
+            aggregate[key] += value
+    return aggregate
+
+
+
+def _student_slot_statuses(
+    record_lookup: dict[tuple[int, str], AttendanceRecord],
+    student_user_id: int,
+    assignments: list[SessionSlotAssignment],
+) -> dict[str, str | None]:
+    return {
+        assignment.projection_key: (
+            record_lookup[(student_user_id, assignment.projection_key)].final_status
+            if (student_user_id, assignment.projection_key) in record_lookup
+            else None
+        )
+        for assignment in assignments
+    }
+
 
 
 def get_attendance_session_roster(db: Session, professor_id: str, session_id: int) -> dict[str, Any]:
@@ -559,61 +829,56 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
     if course is None or course.professor_user_id != professor.id:
         raise attendance_api_error(403, "FORBIDDEN", "session does not belong to the authenticated professor")
 
-    enrolled_rows = db.execute(
-        select(User.id, User.student_id, User.name)
-        .join(CourseEnrollment, CourseEnrollment.student_user_id == User.id)
-        .where(CourseEnrollment.course_id == course.id, CourseEnrollment.status == "active", User.role == "student")
-        .order_by(User.student_id.asc())
-    ).all()
-    records = db.scalars(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id == session.id)).all()
-    record_index = {record.student_user_id: record for record in records}
-    history_counts = {
-        student_user_id: count
-        for student_user_id, count in db.execute(
-            select(AttendanceStatusAuditLog.student_user_id, func.count(AttendanceStatusAuditLog.id))
-            .join(AttendanceSession, AttendanceSession.id == AttendanceStatusAuditLog.attendance_session_id)
-            .where(AttendanceSession.course_id == course.id)
-            .group_by(AttendanceStatusAuditLog.student_user_id)
-        )
-    }
+    assignments = _session_assignments_for_one(db, session)
+    slot_map = _projection_slot_lookup(db, course, professor)
+    enrolled_rows = _enrolled_students_for_course(db, course.id)
+    history_counts = _history_counts_for_course(db, course.id)
+    record_lookup = _records_for_session(db, session.id)
     students = []
     for student_user_id, student_login_id, student_name in enrolled_rows:
-        record = record_index.get(student_user_id)
+        anchor_record = record_lookup.get((student_user_id, session.projection_key))
         students.append(
             {
                 "student_id": student_login_id,
                 "student_name": student_name,
-                "final_status": record.final_status if record else None,
-                "attendance_reason": record.attendance_reason if record else None,
+                "final_status": anchor_record.final_status if anchor_record else "absent",
+                "attendance_reason": anchor_record.attendance_reason if anchor_record else None,
                 "history_count": history_counts.get(student_user_id, 0),
+                "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
             }
         )
 
-    counts = _record_counts_for_sessions(db, [session.id]).get(session.id, {})
+    counts_by_slot = _record_counts_for_slots(db, [session.id])
+    aggregate = _aggregate_counts_for_assignments(counts_by_slot, session.id, assignments)
     return {
         "session": {
             "session_id": session.id,
             "projection_key": session.projection_key,
+            "projection_keys": [assignment.projection_key for assignment in assignments],
+            "included_slots": [_serialize_assignment(slot_map, assignment) for assignment in assignments],
             "mode": session.mode,
             "status": session.status,
             "expires_at": _serialize_dt(session.expires_at),
             "version": session.latest_version,
             "course_code": course.course_code,
+            "bundle_slot_count": len(assignments),
         },
         "students": students,
         "aggregate": {
-            "present": counts.get("present", 0),
-            "late": counts.get("late", 0),
-            "absent": counts.get("absent", 0),
-            "official": counts.get("official", 0) + counts.get("sick", 0),
-            "sick": counts.get("sick", 0),
+            "present": aggregate.get("present", 0),
+            "late": aggregate.get("late", 0),
+            "absent": aggregate.get("absent", 0),
+            "official": aggregate.get("official", 0) + aggregate.get("sick", 0),
+            "sick": aggregate.get("sick", 0),
         },
     }
 
 
+
 def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_code: str, projection_key: str) -> dict[str, Any]:
     professor, course = get_owned_course(db, professor_id, course_code)
-    slot = _projection_slot_lookup(db, course, professor).get(projection_key)
+    slot_map = _projection_slot_lookup(db, course, professor)
+    slot = slot_map.get(projection_key)
     if slot is None:
         raise attendance_api_error(
             404,
@@ -624,14 +889,49 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
 
     latest_session = _latest_session_for_projection(db, projection_key)
     if latest_session is not None:
-        return get_attendance_session_roster(db, professor_id, latest_session.id)
+        assignments = _session_assignments_for_one(db, latest_session)
+        record_lookup = _records_for_session(db, latest_session.id)
+        history_counts = _history_counts_for_course(db, course.id)
+        enrolled_rows = _enrolled_students_for_course(db, course.id)
+        students = []
+        for student_user_id, student_login_id, student_name in enrolled_rows:
+            record = record_lookup.get((student_user_id, projection_key))
+            students.append(
+                {
+                    "student_id": student_login_id,
+                    "student_name": student_name,
+                    "final_status": record.final_status if record else None,
+                    "attendance_reason": record.attendance_reason if record else None,
+                    "history_count": history_counts.get(student_user_id, 0),
+                    "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
+                }
+            )
+        counts_by_slot = _record_counts_for_slots(db, [latest_session.id])
+        aggregate = counts_by_slot.get((latest_session.id, projection_key), _counts_template())
+        return {
+            "session": {
+                "session_id": latest_session.id,
+                "projection_key": projection_key,
+                "projection_keys": [assignment.projection_key for assignment in assignments],
+                "included_slots": [_serialize_assignment(slot_map, assignment) for assignment in assignments],
+                "mode": latest_session.mode,
+                "status": latest_session.status,
+                "expires_at": _serialize_dt(latest_session.expires_at),
+                "version": latest_session.latest_version,
+                "course_code": course.course_code,
+                "bundle_session_id": latest_session.id,
+                "bundle_anchor_projection_key": latest_session.projection_key,
+            },
+            "students": students,
+            "aggregate": {
+                "present": aggregate.get("present", 0),
+                "late": aggregate.get("late", 0),
+                "absent": aggregate.get("absent", 0),
+                "official": aggregate.get("official", 0) + aggregate.get("sick", 0),
+                "sick": aggregate.get("sick", 0),
+            },
+        }
 
-    enrolled_rows = db.execute(
-        select(User.student_id, User.name)
-        .join(CourseEnrollment, CourseEnrollment.student_user_id == User.id)
-        .where(CourseEnrollment.course_id == course.id, CourseEnrollment.status == "active", User.role == "student")
-        .order_by(User.student_id.asc())
-    ).all()
     students = [
         {
             "student_id": student_id,
@@ -639,13 +939,27 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
             "final_status": None,
             "attendance_reason": None,
             "history_count": 0,
+            "slot_statuses": {projection_key: None},
         }
-        for student_id, student_name in enrolled_rows
+        for _, student_id, student_name in _enrolled_students_for_course(db, course.id)
     ]
     return {
         "session": {
             "session_id": None,
             "projection_key": slot.projection_key,
+            "projection_keys": [slot.projection_key],
+            "included_slots": [
+                {
+                    "projection_key": slot.projection_key,
+                    "classroom_code": slot.classroom_code,
+                    "session_date": _serialize_date(slot.session_date),
+                    "slot_start_at": _serialize_time(slot.slot_start_at),
+                    "slot_end_at": _serialize_time(slot.slot_end_at),
+                    "display_label": slot.display_label,
+                    "period_label": slot.period_label,
+                    "slot_order": 0,
+                }
+            ],
             "mode": None,
             "status": "unchecked",
             "expires_at": None,
@@ -663,9 +977,11 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
     }
 
 
+
 def _next_version(session: AttendanceSession) -> int:
     session.latest_version += 1
     return session.latest_version
+
 
 
 def update_attendance_session_record(
@@ -674,12 +990,12 @@ def update_attendance_session_record(
     session_id: int,
     student_id: str,
     new_status: str,
-    reason: str,
+    reason: str | None,
+    projection_key: str | None = None,
 ) -> dict[str, Any]:
     if new_status not in FINAL_STATUSES:
         raise attendance_api_error(400, "INVALID_ATTENDANCE_STATUS", "invalid attendance status", {"status": new_status})
-    if not reason.strip():
-        raise attendance_api_error(400, "ATTENDANCE_REASON_REQUIRED", "attendance reason is required")
+    normalized_reason = (reason or "").strip()
 
     professor = get_professor_user(db, professor_id)
     student = get_student_user(db, student_id)
@@ -693,55 +1009,87 @@ def update_attendance_session_record(
         raise attendance_api_error(409, "SESSION_NOT_OPEN", "canceled sessions cannot accept roster mutations")
     ensure_student_enrolled(db, student.id, course.id, student_id, course.course_code)
 
-    record = db.scalar(
-        select(AttendanceRecord).where(
-            AttendanceRecord.attendance_session_id == session.id,
-            AttendanceRecord.student_user_id == student.id,
-        )
-    )
-    previous_status = record.final_status if record else None
+    assignments = _session_assignments_for_one(db, session)
+    if projection_key is not None:
+        assignments = [assignment for assignment in assignments if assignment.projection_key == projection_key]
+        if not assignments:
+            raise attendance_api_error(
+                404,
+                "SESSION_SLOT_INVALID",
+                "projection key is not part of the attendance session",
+                {"session_id": session_id, "projection_key": projection_key},
+            )
+
+    audit_rows: list[AttendanceStatusAuditLog] = []
+    changed_projection_keys: list[str] = []
     now = _utcnow()
-    if record is None:
-        record = AttendanceRecord(
-            attendance_session_id=session.id,
-            student_user_id=student.id,
-            final_status=new_status,
-            attendance_reason=reason.strip(),
-            finalized_by_user_id=professor.id,
-            finalized_at=now,
+    target_reason = normalized_reason or None
+    for assignment in assignments:
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session.id,
+                AttendanceRecord.projection_key == assignment.projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
         )
-        db.add(record)
-    else:
-        record.final_status = new_status
-        record.attendance_reason = reason.strip()
-        record.finalized_by_user_id = professor.id
-        record.finalized_at = now
-    version = _next_version(session)
-    db.add(
-        AttendanceStatusAuditLog(
-            attendance_session_id=session.id,
-            student_user_id=student.id,
-            actor_user_id=professor.id,
-            actor_role="professor",
-            change_source="professor-manual",
-            previous_status=previous_status,
-            new_status=new_status,
-            reason=reason.strip(),
-            changed_at=now,
-            version=version,
+        previous_status = record.final_status if record else None
+        previous_reason = record.attendance_reason if record else None
+        if previous_status == new_status and previous_reason == target_reason:
+            continue
+        if record is None:
+            record = AttendanceRecord(
+                attendance_session_id=session.id,
+                projection_key=assignment.projection_key,
+                student_user_id=student.id,
+                final_status=new_status,
+                attendance_reason=target_reason,
+                finalized_by_user_id=professor.id,
+                finalized_at=now,
+            )
+            db.add(record)
+        else:
+            record.final_status = new_status
+            record.attendance_reason = target_reason
+            record.finalized_by_user_id = professor.id
+            record.finalized_at = now
+        changed_projection_keys.append(assignment.projection_key)
+        audit_rows.append(
+            AttendanceStatusAuditLog(
+                attendance_session_id=session.id,
+                projection_key=assignment.projection_key,
+                student_user_id=student.id,
+                actor_user_id=professor.id,
+                actor_role="professor",
+                change_source="professor-slot-exception" if projection_key is not None else "professor-manual",
+                previous_status=previous_status,
+                new_status=new_status,
+                reason=target_reason,
+                changed_at=now,
+                version=0,
+            )
         )
-    )
-    db.commit()
+
+    version = session.latest_version
+    if audit_rows:
+        version = _next_version(session)
+        for row in audit_rows:
+            row.version = version
+            db.add(row)
+        db.commit()
+
     return {
         "session_id": session.id,
-        "projection_key": session.projection_key,
+        "projection_key": projection_key or session.projection_key,
+        "projection_keys": changed_projection_keys or [assignment.projection_key for assignment in assignments],
         "student_id": student_id,
         "new_status": new_status,
-        "reason": reason.strip(),
+        "reason": normalized_reason,
         "version": version,
         "course_code": course.course_code,
         "occurred_at": _serialize_dt(now),
+        "changed": bool(audit_rows),
     }
+
 
 
 def list_attendance_history(db: Session, professor_id: str, course_code: str, student_id: str) -> dict[str, Any]:
@@ -764,7 +1112,7 @@ def list_attendance_history(db: Session, professor_id: str, course_code: str, st
             AttendanceStatusAuditLog.changed_at,
             AttendanceStatusAuditLog.version,
             AttendanceStatusAuditLog.actor_user_id,
-            AttendanceSession.projection_key,
+            AttendanceStatusAuditLog.projection_key,
         )
         .join(AttendanceSession, AttendanceSession.id == AttendanceStatusAuditLog.attendance_session_id)
         .where(AttendanceSession.course_id == course.id, AttendanceStatusAuditLog.student_user_id == student.id)
@@ -796,12 +1144,24 @@ def list_attendance_history(db: Session, professor_id: str, course_code: str, st
     }
 
 
-def _presence_eligibility_for_session(db: Session, presence_client: PresenceClient, student: User, course: Course, session: AttendanceSession) -> dict[str, Any]:
-    classroom = db.scalar(select(Classroom).where(Classroom.id == session.classroom_id))
+
+def _registered_devices_payload(db: Session, student: User) -> list[dict[str, str]]:
     devices = db.scalars(
         select(RegisteredDevice).where(RegisteredDevice.user_id == student.id, RegisteredDevice.status == "active")
     ).all()
-    registered_devices = [{"mac": device.mac_address, "label": device.label} for device in devices]
+    return [{"mac": device.mac_address, "label": device.label} for device in devices]
+
+
+
+def _presence_eligibility_for_assignment(
+    db: Session,
+    presence_client: PresenceClient,
+    student: User,
+    course: Course,
+    assignment: SessionSlotAssignment,
+    registered_devices: list[dict[str, str]],
+) -> dict[str, Any]:
+    classroom = db.scalar(select(Classroom).where(Classroom.id == assignment.classroom_id))
     if not registered_devices:
         return {
             "eligible": False,
@@ -822,7 +1182,7 @@ def _presence_eligibility_for_session(db: Session, presence_client: PresenceClie
                 "ssid": network.ssid,
                 "signalThresholdDbm": network.signal_threshold_dbm,
             }
-            for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == session.classroom_id))
+            for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == assignment.classroom_id))
         ],
         registered_devices=registered_devices,
     )
@@ -834,6 +1194,7 @@ def _presence_eligibility_for_session(db: Session, presence_client: PresenceClie
         "snapshot_age_seconds": payload.get("snapshotAgeSeconds"),
         "evidence": payload.get("evidence", {}),
     }
+
 
 
 def list_student_active_attendance_sessions(
@@ -857,21 +1218,44 @@ def list_student_active_attendance_sessions(
         )
         .order_by(AttendanceSession.session_date.asc(), AttendanceSession.slot_start_at.asc(), AttendanceSession.id.asc())
     ).all()
+    assignments_by_session = _session_slot_assignments(db, sessions)
+    registered_devices = _registered_devices_payload(db, student)
     serialized_sessions = []
     for session in sessions:
-        slot = slot_map.get(session.projection_key)
-        eligibility = _presence_eligibility_for_session(db, presence_client, student, course, session)
+        assignments = assignments_by_session.get(session.id, [_fallback_session_assignment(session)])
+        eligibilities = [
+            {
+                "projection_key": assignment.projection_key,
+                "eligibility": _presence_eligibility_for_assignment(
+                    db,
+                    presence_client,
+                    student,
+                    course,
+                    assignment,
+                    registered_devices,
+                ),
+            }
+            for assignment in assignments
+        ]
+        changed_or_present = [item for item in eligibilities if item["eligibility"]["eligible"]]
+        anchor_slot = slot_map.get(session.projection_key)
         serialized_sessions.append(
             {
                 "session_id": session.id,
                 "projection_key": session.projection_key,
-                "display_label": slot.display_label if slot else session.projection_key,
+                "projection_keys": [assignment.projection_key for assignment in assignments],
+                "included_slots": [_serialize_assignment(slot_map, assignment) for assignment in assignments],
+                "display_label": anchor_slot.display_label if anchor_slot else session.projection_key,
                 "session_date": _serialize_date(session.session_date),
                 "slot_start_at": _serialize_time(session.slot_start_at),
                 "slot_end_at": _serialize_time(session.slot_end_at),
                 "expires_at": _serialize_dt(session.expires_at),
-                "can_check_in": bool(eligibility["eligible"]),
-                "eligibility": eligibility,
+                "can_check_in": bool(changed_or_present),
+                "eligibility": {
+                    "eligible_slot_count": len(changed_or_present),
+                    "rejected_slot_count": len(eligibilities) - len(changed_or_present),
+                    "per_slot": eligibilities,
+                },
                 "version": session.latest_version,
             }
         )
@@ -880,6 +1264,7 @@ def list_student_active_attendance_sessions(
         "student_id": student_id,
         "sessions": serialized_sessions,
     }
+
 
 
 def student_attendance_check_in(db: Session, presence_client: PresenceClient, student_id: str, session_id: int) -> dict[str, Any]:
@@ -896,77 +1281,122 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
     if session.mode != "smart" or session.status != "active":
         raise attendance_api_error(409, "SESSION_NOT_OPEN", "smart attendance session is not open", {"session_id": session_id})
 
-    eligibility = _presence_eligibility_for_session(db, presence_client, student, course, session)
-    if not eligibility["eligible"]:
-        raise attendance_api_error(
-            409,
-            eligibility["reason_code"],
-            "attendance check-in is not allowed",
-            {"session_id": session_id, "eligibility": eligibility},
-        )
-
-    record = db.scalar(
-        select(AttendanceRecord).where(
-            AttendanceRecord.attendance_session_id == session.id,
-            AttendanceRecord.student_user_id == student.id,
-        )
-    )
+    assignments = _session_assignments_for_one(db, session)
+    registered_devices = _registered_devices_payload(db, student)
     now = _utcnow()
-    if record is not None and record.final_status == "present":
-        return {
-            "code": "ATTENDANCE_CHECK_IN_OK",
-            "session_id": session.id,
-            "projection_key": session.projection_key,
-            "student_id": student_id,
-            "status": record.final_status,
-            "version": session.latest_version,
-            "occurred_at": _serialize_dt(now),
-            "course_code": course.course_code,
-            "idempotent": True,
-        }
+    pending_audits: list[AttendanceStatusAuditLog] = []
+    changed_projection_keys: list[str] = []
+    already_present_count = 0
+    rejected_count = 0
+    per_slot_results: list[dict[str, Any]] = []
 
-    previous_status = record.final_status if record else None
-    if record is None:
-        record = AttendanceRecord(
-            attendance_session_id=session.id,
-            student_user_id=student.id,
-            final_status="present",
-            attendance_reason="학생 self check-in",
-            finalized_by_user_id=student.id,
-            finalized_at=now,
+    for assignment in assignments:
+        eligibility = _presence_eligibility_for_assignment(
+            db,
+            presence_client,
+            student,
+            course,
+            assignment,
+            registered_devices,
         )
-        db.add(record)
-    else:
-        record.final_status = "present"
-        record.attendance_reason = record.attendance_reason or "학생 self check-in"
-        record.finalized_by_user_id = student.id
-        record.finalized_at = now
-    version = _next_version(session)
-    db.add(
-        AttendanceStatusAuditLog(
-            attendance_session_id=session.id,
-            student_user_id=student.id,
-            actor_user_id=student.id,
-            actor_role="student",
-            change_source="self-checkin",
-            previous_status=previous_status,
-            new_status="present",
-            reason="학생 self check-in",
-            changed_at=now,
-            version=version,
+        if not eligibility["eligible"]:
+            rejected_count += 1
+            per_slot_results.append(
+                {
+                    "projection_key": assignment.projection_key,
+                    "result": "rejected",
+                    "reason_code": eligibility["reason_code"],
+                    "eligibility": eligibility,
+                }
+            )
+            continue
+
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session.id,
+                AttendanceRecord.projection_key == assignment.projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
         )
-    )
-    db.commit()
+        if record is not None and record.final_status == "present":
+            already_present_count += 1
+            per_slot_results.append(
+                {
+                    "projection_key": assignment.projection_key,
+                    "result": "already-present",
+                    "reason_code": "OK",
+                    "eligibility": eligibility,
+                }
+            )
+            continue
+
+        previous_status = record.final_status if record else None
+        if record is None:
+            record = AttendanceRecord(
+                attendance_session_id=session.id,
+                projection_key=assignment.projection_key,
+                student_user_id=student.id,
+                final_status="present",
+                attendance_reason="학생 self check-in",
+                finalized_by_user_id=student.id,
+                finalized_at=now,
+            )
+            db.add(record)
+        else:
+            record.final_status = "present"
+            record.attendance_reason = record.attendance_reason or "학생 self check-in"
+            record.finalized_by_user_id = student.id
+            record.finalized_at = now
+        changed_projection_keys.append(assignment.projection_key)
+        pending_audits.append(
+            AttendanceStatusAuditLog(
+                attendance_session_id=session.id,
+                projection_key=assignment.projection_key,
+                student_user_id=student.id,
+                actor_user_id=student.id,
+                actor_role="student",
+                change_source="self-checkin",
+                previous_status=previous_status,
+                new_status="present",
+                reason="학생 self check-in",
+                changed_at=now,
+                version=0,
+            )
+        )
+        per_slot_results.append(
+            {
+                "projection_key": assignment.projection_key,
+                "result": "checked-in",
+                "reason_code": "OK",
+                "eligibility": eligibility,
+            }
+        )
+
+    version = session.latest_version
+    if pending_audits:
+        version = _next_version(session)
+        for audit in pending_audits:
+            audit.version = version
+            db.add(audit)
+        db.commit()
+
+    changed_count = len(changed_projection_keys)
     return {
         "code": "ATTENDANCE_CHECK_IN_OK",
         "session_id": session.id,
         "projection_key": session.projection_key,
+        "projection_keys": [assignment.projection_key for assignment in assignments],
+        "changed_projection_keys": changed_projection_keys,
         "student_id": student_id,
-        "status": "present",
+        "status": "present" if changed_count or already_present_count else "rejected",
         "version": version,
         "occurred_at": _serialize_dt(now),
         "course_code": course.course_code,
-        "idempotent": False,
+        "idempotent": changed_count == 0 and already_present_count > 0 and rejected_count == 0,
+        "changed_count": changed_count,
+        "already_present_count": already_present_count,
+        "rejected_count": rejected_count,
+        "results": per_slot_results,
     }
 
 

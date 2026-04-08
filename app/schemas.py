@@ -187,4 +187,5 @@ class AttendanceSessionBatchRequest(BaseModel):
 
 class AttendanceRecordUpdateRequest(BaseModel):
     status: Literal["present", "absent", "late", "official", "sick"]
-    reason: str
+    reason: str | None = ""
+    projection_key: str | None = None
