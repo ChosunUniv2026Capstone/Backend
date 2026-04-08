@@ -21,6 +21,8 @@ from app.db import SessionLocal, get_db
 from app.attendance import (
     attendance_event_payload,
     build_attendance_report,
+    build_professor_student_attendance_stats,
+    build_student_attendance_semester_matrix,
     build_attendance_timeline,
     close_attendance_session,
     expire_stale_attendance_sessions,
@@ -1045,8 +1047,31 @@ async def professor_attendance_report(
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
-        )
+    )
     return build_attendance_report(db, professor_id, course_code)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/student-stats")
+async def professor_attendance_student_stats(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return build_professor_student_attendance_stats(db, professor_id, course_code)
 
 
 @app.post("/api/professors/{professor_id}/courses/{course_code}/attendance/sessions/batch")
@@ -1193,8 +1218,31 @@ async def student_active_attendance_sessions(
                 session_ids=[event["session_id"]],
                 version=event["version"],
             ),
-        )
+    )
     return list_student_active_attendance_sessions(db, presence_client, student_id, course_code)
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/attendance/semester-matrix")
+async def student_attendance_semester_matrix(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_student_course_access(student_id, course_code, current_user, db)
+    expired_events = expire_stale_attendance_sessions(db, course_code)
+    for event in expired_events:
+        await attendance_broker.publish(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
+    return build_student_attendance_semester_matrix(db, student_id, course_code)
 
 
 @app.post("/api/students/{student_id}/attendance/sessions/{session_id}/check-in")

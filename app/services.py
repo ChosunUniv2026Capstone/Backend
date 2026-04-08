@@ -136,7 +136,7 @@ def list_student_courses(db: Session, student_id: str) -> list[dict]:
             Course.course_code,
             Course.title,
             User.name,
-            Classroom.classroom_code,
+            func.min(Classroom.classroom_code),
         )
         .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
         .join(User, User.id == Course.professor_user_id, isouter=True)
@@ -146,6 +146,7 @@ def list_student_courses(db: Session, student_id: str) -> list[dict]:
             CourseEnrollment.student_user_id == user.id,
             CourseEnrollment.status == "active",
         )
+        .group_by(Course.id, Course.course_code, Course.title, User.name)
         .order_by(Course.course_code.asc())
     )
     return [
@@ -165,10 +166,11 @@ def list_professor_courses(db: Session, professor_id: str) -> list[dict]:
     if not professor:
         raise HTTPException(status_code=404, detail="professor not found")
     rows = db.execute(
-        select(Course.id, Course.course_code, Course.title, Classroom.classroom_code)
+        select(Course.id, Course.course_code, Course.title, func.min(Classroom.classroom_code))
         .join(CourseSchedule, CourseSchedule.course_id == Course.id, isouter=True)
         .join(Classroom, Classroom.id == CourseSchedule.classroom_id, isouter=True)
         .where(Course.professor_user_id == professor.id)
+        .group_by(Course.id, Course.course_code, Course.title)
         .order_by(Course.course_code.asc())
     )
     return [

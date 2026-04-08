@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "smart-class-dev-jwt-secret"
     access_token_ttl_seconds: int = 900
     refresh_token_ttl_seconds: int = 60 * 60 * 24 * 7
+    access_cookie_name: str = "smartclass_access"
+    access_cookie_secure: bool = False
+    access_cookie_samesite: str = "lax"
+    access_cookie_path: str = "/"
+    access_cookie_domain: str | None = None
     refresh_cookie_name: str = "smartclass_refresh"
     refresh_cookie_secure: bool = False
     refresh_cookie_samesite: str = "lax"

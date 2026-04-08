@@ -276,6 +276,7 @@ def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
     assert payload["data"]["user"]["login_id"] == "20201239"
     assert payload["data"]["access_token"].count(".") == 2
     assert payload["access_token"] == payload["data"]["access_token"]
+    assert login.cookies.get("smartclass_access")
     assert login.cookies.get("smartclass_refresh")
     set_cookie = login.headers.get("set-cookie", "")
     assert "HttpOnly" in set_cookie
@@ -286,9 +287,77 @@ def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
     assert bootstrap.status_code == 200
     bootstrap_payload = bootstrap.json()
     assert bootstrap_payload["success"] is True
-    assert bootstrap_payload["meta"]["restored_via"] == "refresh-cookie"
+    assert bootstrap_payload["meta"]["restored_via"] == "access-cookie"
     assert bootstrap_payload["data"]["user"]["login_id"] == "20201239"
     assert "CSE116" in bootstrap_payload["data"]["route_access"]["student_course_codes"]
+
+
+def test_cookie_backed_access_allows_protected_route_without_authorization_header() -> None:
+    client, _ = make_client()
+    login = client.post("/api/auth/login", json={"login_id": "20201239", "password": "devpass123"})
+    assert login.status_code == 200
+
+    response = client.get("/api/students/20201239/courses")
+    assert response.status_code == 200
+    assert any(course["course_code"] == "CSE116" for course in response.json())
+
+
+def test_professor_courses_are_deduplicated_when_multiple_schedule_rows_exist() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        course = db.scalar(select(Course).where(Course.course_code == "CSE116"))
+        classroom = db.scalar(select(Classroom).where(Classroom.classroom_code == "B101"))
+        db.add(
+            CourseSchedule(
+                course_id=course.id,
+                classroom_id=classroom.id,
+                day_of_week=(datetime.now().weekday() + 2) % 7,
+                starts_at=(datetime.now() - timedelta(minutes=90)).time().replace(microsecond=0),
+                ends_at=(datetime.now() - timedelta(minutes=30)).time().replace(microsecond=0),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/professors/PRF002/courses", headers=auth_header("PRF002"))
+    assert response.status_code == 200
+    course_codes = [course["course_code"] for course in response.json()]
+    assert course_codes.count("CSE116") == 1
+
+
+def test_student_courses_are_deduplicated_when_multiple_schedule_rows_exist() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        course = db.scalar(select(Course).where(Course.course_code == "CSE116"))
+        classroom = db.scalar(select(Classroom).where(Classroom.classroom_code == "B101"))
+        db.add(
+            CourseSchedule(
+                course_id=course.id,
+                classroom_id=classroom.id,
+                day_of_week=(datetime.now().weekday() + 3) % 7,
+                starts_at=(datetime.now() - timedelta(minutes=120)).time().replace(microsecond=0),
+                ends_at=(datetime.now() - timedelta(minutes=60)).time().replace(microsecond=0),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/students/20201239/courses", headers=auth_header("20201239"))
+    assert response.status_code == 200
+    course_codes = [course["course_code"] for course in response.json()]
+    assert course_codes.count("CSE116") == 1
 
 
 def test_refresh_rotates_cookie_and_rejects_replay() -> None:

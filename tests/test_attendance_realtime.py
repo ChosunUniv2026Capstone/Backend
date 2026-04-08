@@ -345,7 +345,8 @@ def test_bundle_roster_defaults_to_anchor_absent_and_slot_preview_stays_slot_spe
     preview_payload = slot_preview.json()
     assert preview_payload["session"]["session_id"] == session_id
     assert preview_payload["session"]["projection_key"] == second_projection_key
-    assert all(student["final_status"] is None for student in preview_payload["students"])
+    assert all(student["final_status"] == "absent" for student in preview_payload["students"])
+    assert preview_payload["aggregate"]["absent"] == 2
 
 
 def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() -> None:
@@ -483,6 +484,104 @@ def test_bundle_close_realtime_event_contains_all_projection_keys() -> None:
         event = websocket.receive_json()
         assert event["event_type"] == "attendance.session.closed"
         assert event["projection_keys"] == projection_keys
+
+
+def test_smart_close_materializes_missing_absences_and_clears_active_summary() -> None:
+    client, _, _ = make_client()
+    session_id, projection_keys = _open_bundle_session(client, mode="smart")
+
+    check_in = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+    assert check_in.status_code == 200
+
+    close = client.post(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/close",
+        headers=auth_header("PRF002"),
+    )
+    assert close.status_code == 200
+
+    roster = client.get(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/roster",
+        headers=auth_header("PRF002"),
+    )
+    assert roster.status_code == 200
+    roster_payload = roster.json()
+    assert roster_payload["session"]["status"] == "closed"
+    assert roster_payload["session"]["expires_at"] is None
+    assert roster_payload["aggregate"]["present"] == 2
+    assert roster_payload["aggregate"]["absent"] == 2
+
+    report = client.get(
+        "/api/professors/PRF002/courses/CSE116/attendance/report",
+        headers=auth_header("PRF002"),
+    )
+    assert report.status_code == 200
+    report_payload = report.json()
+    assert report_payload["active_session_count"] == 0
+    assert report_payload["present"] == 2
+    assert report_payload["absent"] == 2
+
+    timeline = client.get(
+        "/api/professors/PRF002/courses/CSE116/attendance/timeline",
+        headers=auth_header("PRF002"),
+    )
+    assert timeline.status_code == 200
+    first_two_slots = timeline.json()["weeks"][0]["slots"][:2]
+    assert {slot["projection_key"] for slot in first_two_slots} == set(projection_keys)
+    assert all(slot["session_status"] == "closed" for slot in first_two_slots)
+    assert all(slot["expires_at"] is None for slot in first_two_slots)
+
+
+def test_professor_student_stats_return_course_semester_totals() -> None:
+    client, _, _ = make_client()
+    session_id, _ = _open_session(client, mode="manual")
+    update = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "present", "reason": ""},
+    )
+    assert update.status_code == 200
+
+    stats = client.get(
+        "/api/professors/PRF002/courses/CSE116/attendance/student-stats",
+        headers=auth_header("PRF002"),
+    )
+    assert stats.status_code == 200
+    rows = {row["student_id"]: row for row in stats.json()["rows"]}
+    assert rows["20201239"]["present"] == 1
+    assert rows["20201239"]["absent"] == 0
+    assert rows["20201240"]["present"] == 0
+    assert rows["20201240"]["absent"] == 1
+
+
+def test_student_semester_matrix_marks_pending_until_smart_close_then_absent() -> None:
+    client, _, _ = make_client()
+    session_id, projection_keys = _open_bundle_session(client, mode="smart")
+
+    matrix = client.get(
+        "/api/students/20201240/courses/CSE116/attendance/semester-matrix",
+        headers=auth_header("20201240"),
+    )
+    assert matrix.status_code == 200
+    first_two = matrix.json()["weeks"][0]["slots"][:2]
+    assert {slot["projection_key"] for slot in first_two} == set(projection_keys)
+    assert all(slot["status"] == "pending" for slot in first_two)
+
+    close = client.post(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/close",
+        headers=auth_header("PRF002"),
+    )
+    assert close.status_code == 200
+
+    matrix_after = client.get(
+        "/api/students/20201240/courses/CSE116/attendance/semester-matrix",
+        headers=auth_header("20201240"),
+    )
+    assert matrix_after.status_code == 200
+    first_two_after = matrix_after.json()["weeks"][0]["slots"][:2]
+    assert all(slot["status"] == "absent" for slot in first_two_after)
 
 
 def test_student_check_in_is_idempotent_and_updates_report() -> None:
