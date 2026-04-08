@@ -33,7 +33,7 @@ WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 def _utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -513,7 +513,7 @@ def expire_stale_attendance_sessions(db: Session, course_code: str | None = None
             changed_at=now,
         )
         session.status = "expired"
-        session.closed_at = now.replace(tzinfo=None)
+        session.closed_at = now
         session.expires_at = None
         session.latest_version = next_version
         projection_keys = [assignment.projection_key for assignment in assignments_by_session.get(session.id, [])]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import time
+from datetime import UTC, datetime, time, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -784,6 +784,23 @@ def test_admin_report_websocket_bootstrap_is_allowed() -> None:
         assert message["event_type"] == "attendance.bootstrap"
         assert message["changed_payload"]["view"] == "report"
         assert message["changed_payload"]["data"]["course_code"] == "CSE116"
+
+
+def test_professor_websocket_bootstrap_publishes_expiration_event_for_stale_smart_session() -> None:
+    client, SessionLocal, _ = make_client()
+    session_id, projection_key = _open_session(client, "smart")
+    with SessionLocal.begin() as db:
+        session = db.get(AttendanceSession, session_id)
+        assert session is not None
+        session.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+
+    with client.websocket_connect("/ws/attendance?token=dev-token:PRF002&courseCode=CSE116&view=professor") as websocket:
+        bootstrap = websocket.receive_json()
+        assert bootstrap["event_type"] == "attendance.bootstrap"
+        expired = websocket.receive_json()
+        assert expired["event_type"] == "attendance.session.expired"
+        assert expired["session_ids"] == [session_id]
+        assert expired["projection_keys"] == [projection_key]
 
 
 def test_bundle_realtime_events_publish_parent_session_with_all_projection_keys() -> None:

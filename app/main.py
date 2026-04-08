@@ -1301,13 +1301,16 @@ async def attendance_websocket(
             websocket,
             {"login_id": login_id, "role": user.role, "view": view, "course_code": courseCode},
         )
+        expired_events: list[dict[str, Any]] = []
         if user.role == "student":
             bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, courseCode)
         elif user.role == "admin":
+            expired_events = expire_stale_attendance_sessions(db, courseCode)
             course = get_course_by_code(db, courseCode)
             owner = db.scalar(select(User).where(User.id == course.professor_user_id))
             bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", courseCode)
         else:
+            expired_events = expire_stale_attendance_sessions(db, courseCode)
             bootstrap_data = build_attendance_timeline(db, user.professor_id or login_id, courseCode)
         await websocket.send_json(
             attendance_event_payload(
@@ -1316,6 +1319,18 @@ async def attendance_websocket(
                 changed_payload={"view": view, "data": bootstrap_data},
             )
         )
+        for event in expired_events:
+            await attendance_broker.publish(
+                courseCode,
+                attendance_event_payload(
+                    event_type=f"attendance.{event['event_type']}",
+                    course_code=courseCode,
+                    projection_keys=event["projection_keys"],
+                    changed_payload=event,
+                    session_ids=[event["session_id"]],
+                    version=event["version"],
+                ),
+            )
         while True:
             await websocket.receive_text()
     except HTTPException:
