@@ -62,6 +62,175 @@ class NoticeResponse(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExamSummaryRead(BaseModel):
+    id: int
+    title: str
+    description: str | None = None
+    exam_type: str
+    status: str
+    starts_at: datetime
+    ends_at: datetime
+    duration_minutes: int
+    requires_presence: bool
+    late_entry_allowed: bool = True
+    auto_submit_enabled: bool = True
+    shuffle_questions: bool = False
+    shuffle_options: bool = False
+    max_attempts: int
+    question_count: int = 0
+    attempt_count: int = 0
+
+
+class StudentExamAvailabilityRead(BaseModel):
+    code: str
+    label: str
+    can_start: bool
+    can_submit: bool
+
+
+class StudentExamAttemptRead(BaseModel):
+    id: int
+    attempt_no: int
+    status: str
+    started_at: datetime | None = None
+    submitted_at: datetime | None = None
+    expires_at: datetime | None = None
+    score: float | None = None
+    total_count: int = 0
+    answered_count: int = 0
+
+
+class StudentExamSummaryRead(ExamSummaryRead):
+    attempts_used: int
+    availability: StudentExamAvailabilityRead | None = None
+    attempt: StudentExamAttemptRead | None = None
+
+
+class ExamQuestionOptionRead(BaseModel):
+    id: int
+    option_order: int
+    option_text: str
+    is_correct: bool | None = None
+
+
+class StudentExamQuestionRead(BaseModel):
+    id: int
+    question_order: int
+    question_type: str
+    prompt: str
+    points: float
+    explanation: str | None = None
+    is_required: bool = True
+    selected_option_id: int | None = None
+    options: list[ExamQuestionOptionRead] = Field(default_factory=list)
+
+
+class StudentExamDetailRead(StudentExamSummaryRead):
+    questions: list[StudentExamQuestionRead] = Field(default_factory=list)
+
+
+class ProfessorExamQuestionRead(StudentExamQuestionRead):
+    options: list[ExamQuestionOptionRead] = Field(default_factory=list)
+
+
+class ProfessorExamChoiceCreateRequest(BaseModel):
+    option_text: str
+    is_correct: bool = False
+
+
+class ProfessorExamQuestionCreateRequest(BaseModel):
+    question_type: Literal["multiple_choice", "true_false"] = "multiple_choice"
+    prompt: str
+    points: float = Field(default=1, gt=0)
+    explanation: str | None = None
+    is_required: bool = True
+    options: list[ProfessorExamChoiceCreateRequest] = Field(default_factory=list)
+
+
+class ProfessorExamCreateRequest(BaseModel):
+    title: str
+    description: str | None = None
+    exam_type: Literal["quiz", "midterm", "final", "practice", "custom"] = "quiz"
+    starts_at: datetime
+    ends_at: datetime
+    duration_minutes: int = Field(gt=0)
+    requires_presence: bool = False
+    late_entry_allowed: bool = True
+    auto_submit_enabled: bool = True
+    shuffle_questions: bool = False
+    shuffle_options: bool = False
+    max_attempts: int = Field(default=1, gt=0)
+    questions: list[ProfessorExamQuestionCreateRequest] = Field(default_factory=list)
+
+
+class ProfessorExamSubmissionOverviewRead(BaseModel):
+    total_students: int = 0
+    started_students: int = 0
+    submitted_students: int = 0
+    not_started_students: int = 0
+    average_score: float | None = None
+    max_score: float = 0
+
+
+class ProfessorExamSubmissionSummaryRead(BaseModel):
+    student_id: str
+    student_name: str
+    status: str
+    attempt_no: int | None = None
+    answered_count: int = 0
+    started_at: datetime | None = None
+    submitted_at: datetime | None = None
+    score: float | None = None
+    max_score: float = 0
+    total_count: int = 0
+
+
+class ProfessorExamDetailRead(ExamSummaryRead):
+    questions: list[ProfessorExamQuestionRead] = Field(default_factory=list)
+    submission_overview: ProfessorExamSubmissionOverviewRead | None = None
+    submissions: list[ProfessorExamSubmissionSummaryRead] = Field(default_factory=list)
+
+
+class ExamSubmissionStartRead(BaseModel):
+    submission_id: int
+    attempt_no: int
+    status: str
+    started_at: datetime
+    expires_at: datetime
+    idempotent: bool = False
+
+
+class StudentExamSubmitAnswerRequest(BaseModel):
+    question_id: int
+    selected_option_id: int | None = None
+    answer_text: str | None = None
+
+
+class StudentExamSubmitRequest(BaseModel):
+    answers: list[StudentExamSubmitAnswerRequest] = Field(default_factory=list)
+
+
+class StudentExamSaveAnswerRequest(BaseModel):
+    selected_option_id: int | None = None
+    answer_text: str | None = None
+
+
+class StudentExamSaveAnswerRead(BaseModel):
+    submission_id: int
+    question_id: int
+    selected_option_id: int | None = None
+    answer_text: str | None = None
+    answered_at: datetime | None = None
+
+
+class StudentExamSubmitResultRead(BaseModel):
+    exam_id: int
+    attempt: StudentExamAttemptRead
+    score: float | None = None
+    total_count: int = 0
+    answered_count: int = 0
+
+
 class UserSummary(BaseModel):
     id: int
     role: str

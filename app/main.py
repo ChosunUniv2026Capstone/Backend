@@ -56,31 +56,53 @@ from app.schemas import (
     CourseRead,
     DeviceCreate,
     DeviceRead,
+    ExamSubmissionStartRead,
+    ProfessorExamDetailRead,
+    ExamSummaryRead,
     HealthResponse,
     NoticeCreate,
     NoticeRead,
     NoticeListResponse,
     NoticeResponse,
+    ProfessorExamCreateRequest,
+    StudentExamDetailRead,
+    StudentExamSaveAnswerRead,
+    StudentExamSaveAnswerRequest,
+    StudentExamSubmitRequest,
+    StudentExamSubmitResultRead,
+    StudentExamSummaryRead,
     UserSummary,
 )
 from app.services import (
     authenticate_user,
     check_attendance_eligibility,
+    close_professor_exam,
+    create_professor_exam,
     create_device,
+    delete_professor_exam,
     create_notice,
     delete_device,
     get_notice_detail,
     get_user_by_login_id,
     get_user_login_id,
+    get_professor_exam_detail,
+    get_student_exam_detail,
     list_classroom_networks,
     list_classroom_networks_for_classroom,
     list_classrooms,
     list_devices,
     list_notices,
     list_presence_device_options,
+    list_professor_exams,
     list_professor_courses,
+    list_student_exams,
     list_student_courses,
+    publish_professor_exam,
+    save_student_exam_answer,
+    submit_student_exam,
+    start_student_exam,
     list_users,
+    update_professor_exam,
     update_classroom_network_threshold,
 )
 
@@ -748,6 +770,214 @@ def get_professor_courses(
 ) -> list[CourseRead]:
     require_professor_self(professor_id, current_user)
     return [CourseRead(**course) for course in list_professor_courses(db, professor_id)]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/exams", response_model=list[StudentExamSummaryRead])
+def get_student_course_exams(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[StudentExamSummaryRead]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return [StudentExamSummaryRead(**exam) for exam in list_student_exams(db, student.id, course.id)]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/exams/{exam_id}", response_model=StudentExamDetailRead)
+def get_student_course_exam_detail(
+    student_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StudentExamDetailRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return StudentExamDetailRead(**get_student_exam_detail(db, student.id, course.id, exam_id))
+
+
+@app.post("/api/students/{student_id}/courses/{course_code}/exams/{exam_id}/start", response_model=ExamSubmissionStartRead)
+def start_student_course_exam(
+    student_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ExamSubmissionStartRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return ExamSubmissionStartRead(
+        **start_student_exam(
+            db=db,
+            presence_client=presence_client,
+            student_id=student_id,
+            student_user_id=student.id,
+            course_code=course_code,
+            course_id=course.id,
+            exam_id=exam_id,
+        )
+    )
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/exams", response_model=list[ExamSummaryRead])
+def get_professor_course_exams(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[ExamSummaryRead]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return [ExamSummaryRead(**exam) for exam in list_professor_exams(db, course.id)]
+
+
+@app.post(
+    "/api/professors/{professor_id}/courses/{course_code}/exams",
+    response_model=ProfessorExamDetailRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_professor_course_exam(
+    professor_id: str,
+    course_code: str,
+    payload: ProfessorExamCreateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+ ) -> ProfessorExamDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorExamDetailRead(**create_professor_exam(db=db, course_id=course.id, payload=payload.model_dump()))
+
+
+@app.get(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}",
+    response_model=ProfessorExamDetailRead,
+)
+def get_professor_course_exam_detail(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorExamDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorExamDetailRead(**get_professor_exam_detail(db=db, course_id=course.id, exam_id=exam_id))
+
+
+@app.put(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}",
+    response_model=ProfessorExamDetailRead,
+)
+def update_professor_course_exam(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    payload: ProfessorExamCreateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorExamDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorExamDetailRead(
+        **update_professor_exam(
+            db=db,
+            course_id=course.id,
+            exam_id=exam_id,
+            payload=payload.model_dump(),
+        )
+    )
+
+
+@app.delete(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_professor_course_exam(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    delete_professor_exam(db=db, course_id=course.id, exam_id=exam_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}/publish",
+    response_model=ProfessorExamDetailRead,
+)
+def publish_professor_course_exam(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorExamDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorExamDetailRead(**publish_professor_exam(db=db, course_id=course.id, exam_id=exam_id))
+
+
+@app.post(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}/close",
+    response_model=ProfessorExamDetailRead,
+)
+def close_professor_course_exam(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorExamDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorExamDetailRead(**close_professor_exam(db=db, course_id=course.id, exam_id=exam_id))
+
+
+@app.post(
+    "/api/students/{student_id}/courses/{course_code}/exams/{exam_id}/submit",
+    response_model=StudentExamSubmitResultRead,
+)
+def submit_student_course_exam(
+    student_id: str,
+    course_code: str,
+    exam_id: int,
+    payload: StudentExamSubmitRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StudentExamSubmitResultRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return StudentExamSubmitResultRead(
+        **submit_student_exam(
+            db=db,
+            student_user_id=student.id,
+            course_id=course.id,
+            exam_id=exam_id,
+            payload=payload.model_dump(),
+        )
+    )
+
+
+@app.put(
+    "/api/students/{student_id}/courses/{course_code}/exams/{exam_id}/submissions/{submission_id}/answers/{question_id}",
+    response_model=StudentExamSaveAnswerRead,
+)
+def save_student_course_exam_answer(
+    student_id: str,
+    course_code: str,
+    exam_id: int,
+    submission_id: int,
+    question_id: int,
+    payload: StudentExamSaveAnswerRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StudentExamSaveAnswerRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return StudentExamSaveAnswerRead(
+        **save_student_exam_answer(
+            db=db,
+            student_user_id=student.id,
+            course_id=course.id,
+            exam_id=exam_id,
+            submission_id=submission_id,
+            question_id=question_id,
+            payload=payload.model_dump(),
+        )
+    )
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/attendance/bootstrap")
