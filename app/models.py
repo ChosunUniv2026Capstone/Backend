@@ -106,7 +106,7 @@ class Exam(Base):
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     duration_minutes: Mapped[int] = mapped_column(Integer)
-    requires_presence: Mapped[bool] = mapped_column(Boolean, default=False)
+    requires_presence: Mapped[bool] = mapped_column(Boolean, default=True)
     late_entry_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_submit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=False)

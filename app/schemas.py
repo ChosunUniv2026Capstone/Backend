@@ -154,7 +154,7 @@ class ProfessorExamCreateRequest(BaseModel):
     starts_at: datetime
     ends_at: datetime
     duration_minutes: int = Field(gt=0)
-    requires_presence: bool = False
+    requires_presence: bool = True
     late_entry_allowed: bool = True
     auto_submit_enabled: bool = True
     shuffle_questions: bool = False

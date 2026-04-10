@@ -232,6 +232,8 @@ def _load_attempt_count_index(db: Session, student_user_id: int, exam_ids: list[
 
 
 def list_student_exams(db: Session, student_user_id: int, course_id: int) -> list[dict]:
+    student_visible_statuses = ("published", "open", "closed")
+
     def count_questions(exam_id: int) -> int:
         return int(db.scalar(select(func.count(ExamQuestion.id)).where(ExamQuestion.exam_id == exam_id)) or 0)
 
@@ -318,7 +320,7 @@ def list_student_exams(db: Session, student_user_id: int, course_id: int) -> lis
             select(Exam)
             .where(
                 Exam.course_id == course_id,
-                Exam.status != "draft",
+                Exam.status.in_(student_visible_statuses),
             )
             .order_by(Exam.starts_at.asc(), Exam.id.asc())
         )
@@ -328,11 +330,13 @@ def list_student_exams(db: Session, student_user_id: int, course_id: int) -> lis
 
 
 def get_student_exam_detail(db: Session, student_user_id: int, course_id: int, exam_id: int) -> dict:
+    student_visible_statuses = ("published", "open", "closed")
+
     exam = db.scalar(
         select(Exam).where(
             Exam.id == exam_id,
             Exam.course_id == course_id,
-            Exam.status != "draft",
+            Exam.status.in_(student_visible_statuses),
         )
     )
     if not exam:
@@ -1033,11 +1037,13 @@ def start_student_exam(
     course_id: int,
     exam_id: int,
 ) -> dict:
+    student_visible_statuses = ("published", "open", "closed")
+
     exam = db.scalar(
         select(Exam).where(
             Exam.id == exam_id,
             Exam.course_id == course_id,
-            Exam.status != "draft",
+            Exam.status.in_(student_visible_statuses),
         )
     )
     if exam is None:
@@ -1159,7 +1165,14 @@ def submit_student_exam(
     exam_id: int,
     payload: dict,
 ) -> dict:
-    exam = db.scalar(select(Exam).where(Exam.id == exam_id, Exam.course_id == course_id, Exam.status != "draft"))
+    student_visible_statuses = ("published", "open", "closed")
+    exam = db.scalar(
+        select(Exam).where(
+            Exam.id == exam_id,
+            Exam.course_id == course_id,
+            Exam.status.in_(student_visible_statuses),
+        )
+    )
     if exam is None:
         raise HTTPException(
             status_code=404,
@@ -1223,7 +1236,14 @@ def save_student_exam_answer(
     question_id: int,
     payload: dict,
 ) -> dict:
-    exam = db.scalar(select(Exam).where(Exam.id == exam_id, Exam.course_id == course_id, Exam.status != "draft"))
+    student_visible_statuses = ("published", "open", "closed")
+    exam = db.scalar(
+        select(Exam).where(
+            Exam.id == exam_id,
+            Exam.course_id == course_id,
+            Exam.status.in_(student_visible_statuses),
+        )
+    )
     if exam is None:
         raise HTTPException(
             status_code=404,
