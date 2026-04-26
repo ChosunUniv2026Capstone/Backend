@@ -1,0 +1,120 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  packages: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Check out release tag
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+
+      - name: Resolve GHCR image name
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        id: image
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=ghcr.io/${owner}/backend" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release image tags
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        id: tags
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          IFS=. read -r major minor patch <<< "$version"
+          revision="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          {
+            echo 'tags<<TAGS'
+            echo "$IMAGE_NAME:v$major.$minor.$patch"
+            echo "$IMAGE_NAME:v$major.$minor"
+            if [ "$major" -gt 0 ]; then
+              echo "$IMAGE_NAME:v$major"
+            fi
+            echo "$IMAGE_NAME:sha-$short_sha"
+            echo 'TAGS'
+            echo "revision=$revision"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: docker/setup-buildx-action@v4
+
+      - name: Publish release image
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag_name }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarize release image
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        shell: bash
+        run: |
+          {
+            echo '## Release image'
+            echo ''
+            echo '- Image: `${{ steps.image.outputs.name }}`'
+            echo '- Tags:'
+            while IFS= read -r tag; do echo "  - \`$tag\`"; done <<< '${{ steps.tags.outputs.tags }}'
+            echo '- Digest: `${{ steps.build.outputs.digest }}`'
+            echo '- Service manifest ref: `${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag_name }}@${{ steps.build.outputs.digest }}`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Try to make GHCR package public
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: backend
+        run: |
+          gh api --method PATCH "/orgs/${{ github.repository_owner }}/packages/container/$PACKAGE_NAME/visibility" -f visibility=public || {
+            echo "::warning::Could not make GHCR package public automatically; configure package visibility manually. Public readiness still requires anonymous pull proof."
+            exit 1
+          }
