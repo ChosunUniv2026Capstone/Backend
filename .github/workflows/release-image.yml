@@ -62,10 +62,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Make GHCR package public
+      - name: Try to make GHCR package public
         if: github.event_name != 'pull_request'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PACKAGE_NAME: backend
         run: |
-          gh api --method PATCH "/orgs/${{ github.repository_owner }}/packages/container/$PACKAGE_NAME/visibility" -f visibility=public
+          gh api --method PATCH "/orgs/${{ github.repository_owner }}/packages/container/$PACKAGE_NAME/visibility" -f visibility=public || {
+            echo "::warning::Could not make GHCR package public automatically; configure package visibility manually or provide GHCR_READ_TOKEN for demo deploy."
+            exit 1
+          }
