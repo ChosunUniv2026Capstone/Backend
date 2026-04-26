@@ -52,7 +52,8 @@ jobs:
           set -euo pipefail
           version="${TAG_NAME#v}"
           IFS=. read -r major minor patch <<< "$version"
-          short_sha="${GITHUB_SHA::7}"
+          revision="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
           {
             echo 'tags<<TAGS'
             echo "$IMAGE_NAME:v$major.$minor.$patch"
@@ -62,6 +63,7 @@ jobs:
             fi
             echo "$IMAGE_NAME:sha-$short_sha"
             echo 'TAGS'
+            echo "revision=$revision"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -87,7 +89,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.release.outputs.tag_name }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.revision }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
