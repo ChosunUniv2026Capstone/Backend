@@ -4,6 +4,7 @@ from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,7 +21,7 @@ def auth_header(login_id: str) -> dict[str, str]:
     return {"Authorization": f"Bearer dev-token:{login_id}"}
 
 
-def make_client(tmp_path: Path) -> TestClient:
+def make_client(tmp_path: Path, *, raise_server_exceptions: bool = True) -> TestClient:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -71,7 +72,7 @@ def make_client(tmp_path: Path) -> TestClient:
     services_module.settings.object_storage_provider = "local"
     services_module.settings.object_storage_local_dir = str(tmp_path)
     get_storage_backend.cache_clear()
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def test_learning_item_upload_download_and_cross_role_denial(tmp_path: Path) -> None:
@@ -103,6 +104,71 @@ def test_learning_item_upload_download_and_cross_role_denial(tmp_path: Path) -> 
         headers=auth_header("20209999"),
     )
     assert denied.status_code == 403
+
+
+def test_missing_learning_object_download_returns_404(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/learning-items",
+        headers=auth_header("PRF002"),
+        data={"kind": "material", "title": "Week 1", "description": "Intro"},
+        files=[("files", ("intro.txt", b"hello learning", "text/plain"))],
+    )
+    assert response.status_code == 201, response.text
+    item = response.json()
+    attachment_id = item["attachments"][0]["id"]
+    [stored_file] = [path for path in tmp_path.rglob("*") if path.is_file()]
+    stored_file.unlink()
+
+    download = client.get(
+        f"/api/students/20201239/courses/CSE116/learning-items/{item['id']}/attachments/{attachment_id}",
+        headers=auth_header("20201239"),
+    )
+
+    assert download.status_code == 404
+    assert download.json()["detail"]["code"] == "OBJECT_NOT_FOUND"
+
+
+def test_notice_attachment_upload_failure_rolls_back_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = make_client(tmp_path, raise_server_exceptions=False)
+
+    def fail_upload(*args, **kwargs):
+        raise RuntimeError("simulated object write failure")
+
+    monkeypatch.setattr(services_module, "_store_domain_upload", fail_upload)
+    response = client.post(
+        "/api/professors/PRF002/notices",
+        headers=auth_header("PRF002"),
+        data={"title": "Attached", "body": "See file", "course_code": "CSE116"},
+        files=[("files", ("notice.txt", b"notice-body", "text/plain"))],
+    )
+    assert response.status_code == 500
+
+    notices = client.get("/api/notices/PRF002", headers=auth_header("PRF002"))
+    assert notices.status_code == 200
+    assert [notice["title"] for notice in notices.json()["data"]] == ["Seed"]
+
+
+def test_learning_item_delete_processes_deletion_outbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = make_client(tmp_path)
+    calls = []
+    monkeypatch.setattr(services_module, "_process_object_deletion_jobs_if_available", lambda db: calls.append("processed") or {"processed": 0})
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/learning-items",
+        headers=auth_header("PRF002"),
+        data={"kind": "material", "title": "Week 1", "description": "Intro"},
+        files=[("files", ("intro.txt", b"hello learning", "text/plain"))],
+    )
+    assert response.status_code == 201, response.text
+    item = response.json()
+
+    delete_response = client.delete(
+        f"/api/professors/PRF002/courses/CSE116/learning-items/{item['id']}",
+        headers=auth_header("PRF002"),
+    )
+
+    assert delete_response.status_code == 204
+    assert calls == ["processed"]
 
 
 def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:

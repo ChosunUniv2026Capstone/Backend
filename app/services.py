@@ -936,6 +936,12 @@ def update_professor_exam(
     return get_professor_exam_detail(db=db, course_id=course_id, exam_id=exam.id)
 
 
+def _process_object_deletion_jobs_if_available(db: Session) -> dict:
+    from app.assignments import process_object_deletion_jobs
+
+    return process_object_deletion_jobs(db)
+
+
 def delete_professor_exam(
     *,
     db: Session,
@@ -955,6 +961,7 @@ def delete_professor_exam(
     _delete_professor_exam_graph(db=db, exam_id=exam.id)
     db.delete(exam)
     db.commit()
+    _process_object_deletion_jobs_if_available(db)
 
 
 def publish_professor_exam(
@@ -1612,7 +1619,15 @@ def get_notice_detail(db: Session, login_id: str, notice_id: int) -> dict:
     return notice
 
 
-def create_notice(db: Session, professor_id: str, title: str, body: str, course_code: str | None) -> Notice:
+def create_notice(
+    db: Session,
+    professor_id: str,
+    title: str,
+    body: str,
+    course_code: str | None,
+    *,
+    commit: bool = True,
+) -> Notice:
     professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
     if not professor:
         raise HTTPException(
@@ -1642,8 +1657,11 @@ def create_notice(db: Session, professor_id: str, title: str, body: str, course_
 
     notice = Notice(author_user_id=professor.id, course_id=course_id, title=title.strip(), body=body.strip())
     db.add(notice)
-    db.commit()
-    db.refresh(notice)
+    if commit:
+        db.commit()
+        db.refresh(notice)
+    else:
+        db.flush()
     return notice
 
 
@@ -1655,9 +1673,9 @@ def create_notice_with_attachments(
     course_code: str | None,
     files: list[UploadFile],
 ) -> Notice:
-    notice = create_notice(db, professor_id, title, body, course_code)
     written_files: list[dict] = []
     try:
+        notice = create_notice(db, professor_id, title, body, course_code, commit=False)
         for upload in [item for item in files if item.filename]:
             written_files.append(_store_domain_upload(upload, prefix=f"notices/{notice.id}"))
         for written in written_files:
@@ -1782,6 +1800,7 @@ def delete_learning_item(db: Session, *, course_id: int, learning_item_id: int) 
         )
     db.delete(item)
     db.commit()
+    _process_object_deletion_jobs_if_available(db)
 
 
 def get_learning_attachment_download(db: Session, *, course: Course, learning_item_id: int, attachment_id: int) -> ObjectDownload:

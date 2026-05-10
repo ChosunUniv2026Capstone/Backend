@@ -28,7 +28,7 @@ from app.auth import (
     verify_access_token,
 )
 from app.config import get_settings
-from app.storage import RangeNotSatisfiableError, get_storage_backend_for_metadata, parse_http_range
+from app.storage import ObjectNotFoundError, RangeNotSatisfiableError, get_storage_backend_for_metadata, parse_http_range
 from app.db import SessionLocal, get_db
 from app.attendance import (
     attendance_event_payload,
@@ -165,6 +165,11 @@ def _stream_storage_download(download, range_header: str | None = None) -> Strea
         raise HTTPException(
             status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
             detail={"code": "OBJECT_RANGE_NOT_SATISFIABLE", "message": "requested range cannot be served", "details": {}},
+        ) from exc
+    except ObjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "OBJECT_NOT_FOUND", "message": "stored object was not found", "details": {}},
         ) from exc
 
     headers = {
