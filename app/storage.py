@@ -314,22 +314,32 @@ def parse_http_range(range_header: str | None, *, object_size: int) -> tuple[int
     return start, min(end, object_size - 1)
 
 
-@lru_cache(maxsize=1)
-def get_storage_backend() -> ObjectStorageBackend:
+def build_storage_backend(*, provider: str, bucket_name: str | None = None) -> ObjectStorageBackend:
     settings = get_settings()
-    provider = settings.object_storage_provider.lower()
-    if provider == "local":
+    normalized_provider = provider.lower()
+    if normalized_provider == "local":
         return LocalStorageBackend(settings.object_storage_local_dir, chunk_size=settings.object_storage_proxy_chunk_size_bytes)
-    if provider == "fake":
+    if normalized_provider == "fake":
         return FakeStorageBackend()
-    if provider == "s3":
+    if normalized_provider == "s3":
         return S3StorageBackend(
             endpoint_url=settings.object_storage_endpoint,
-            bucket_name=settings.object_storage_bucket,
+            bucket_name=bucket_name or settings.object_storage_bucket,
             region_name=settings.object_storage_region,
             access_key=settings.object_storage_access_key,
             secret_key=settings.object_storage_secret_key,
             force_path_style=settings.object_storage_force_path_style,
             chunk_size=settings.object_storage_proxy_chunk_size_bytes,
         )
-    raise StorageError(f"unsupported object storage provider: {settings.object_storage_provider}")
+    raise StorageError(f"unsupported object storage provider: {provider}")
+
+
+@lru_cache(maxsize=1)
+def get_storage_backend() -> ObjectStorageBackend:
+    settings = get_settings()
+    return build_storage_backend(provider=settings.object_storage_provider, bucket_name=settings.object_storage_bucket)
+
+
+def get_storage_backend_for_metadata(provider: str | None, bucket_name: str | None) -> ObjectStorageBackend:
+    settings = get_settings()
+    return build_storage_backend(provider=provider or settings.object_storage_provider, bucket_name=bucket_name or settings.object_storage_bucket)

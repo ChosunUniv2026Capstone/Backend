@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Assignment, AssignmentSubmission, AssignmentSubmissionAttachment, CourseEnrollment, User
-from app.storage import ObjectNotFoundError, get_storage_backend, spool_limited_upload
+from app.storage import ObjectNotFoundError, get_storage_backend, get_storage_backend_for_metadata, spool_limited_upload
 
 settings = get_settings()
 ASSIGNMENT_STORAGE_PREFIX = "assignments"
@@ -118,6 +118,8 @@ class AssignmentAttachmentDownload:
     filename: str
     media_type: str | None
     file_size_bytes: int
+    storage_provider: str | None = None
+    bucket_name: str | None = None
 
 
 def _assignment_storage_key(*, assignment_id: int, submission_id: int, student_user_id: int, stored_filename: str) -> str:
@@ -129,6 +131,24 @@ def _assignment_storage_key(*, assignment_id: int, submission_id: int, student_u
         "students",
         str(student_user_id),
         stored_filename,
+    )
+
+
+def _current_storage_metadata() -> tuple[str, str]:
+    backend = get_storage_backend()
+    provider = backend.provider if backend.provider in {"local", "s3"} else "local"
+    bucket_name = backend.bucket_name or ("local" if provider == "local" else settings.object_storage_bucket)
+    return provider, bucket_name
+
+
+def _storage_backend_for_metadata(provider: str | None, bucket_name: str | None):
+    return get_storage_backend_for_metadata(provider or settings.object_storage_provider, bucket_name or settings.object_storage_bucket)
+
+
+def _storage_backend_for_attachment(attachment: AssignmentSubmissionAttachment):
+    return _storage_backend_for_metadata(
+        getattr(attachment, "storage_provider", None),
+        getattr(attachment, "bucket_name", None),
     )
 
 
@@ -412,7 +432,10 @@ def _store_upload_file(
     with spooled_file:
         get_storage_backend().put_object(storage_key, spooled_file, content_type=mime_type)
 
+    storage_provider, bucket_name = _current_storage_metadata()
     return {
+        "storage_provider": storage_provider,
+        "bucket_name": bucket_name,
         "original_filename": original_filename,
         "stored_filename": stored_filename,
         "mime_type": mime_type,
@@ -515,6 +538,8 @@ def submit_student_assignment(
                         stored_filename=written["stored_filename"],
                         mime_type=written["mime_type"],
                         file_size_bytes=written["file_size_bytes"],
+                        storage_provider=written["storage_provider"],
+                        bucket_name=written["bucket_name"],
                         storage_key=written["storage_key"],
                     )
                 )
@@ -523,12 +548,19 @@ def submit_student_assignment(
     except Exception:
         db.rollback()
         for written in written_files:
-            _delete_object_immediately(written["storage_key"])
+            _delete_object_immediately(
+                written["storage_key"],
+                storage_provider=written.get("storage_provider"),
+                bucket_name=written.get("bucket_name"),
+            )
         raise
 
     if normalized_files:
+        enqueued_deletions = False
         for existing in existing_attachments:
-            _delete_or_enqueue_object(db, existing, reason="assignment_attachment_replaced")
+            enqueued_deletions = _delete_or_enqueue_object(db, existing, reason="assignment_attachment_replaced") or enqueued_deletions
+        if enqueued_deletions:
+            process_object_deletion_jobs(db)
 
     return get_student_assignment_detail(
         db,
@@ -565,6 +597,8 @@ def get_student_assignment_attachment_download(
         filename=attachment.original_filename,
         media_type=attachment.mime_type,
         file_size_bytes=attachment.file_size_bytes,
+        storage_provider=getattr(attachment, "storage_provider", None),
+        bucket_name=getattr(attachment, "bucket_name", None),
     )
 
 
@@ -593,28 +627,35 @@ def get_professor_assignment_attachment_download(
         filename=attachment.original_filename,
         media_type=attachment.mime_type,
         file_size_bytes=attachment.file_size_bytes,
+        storage_provider=getattr(attachment, "storage_provider", None),
+        bucket_name=getattr(attachment, "bucket_name", None),
     )
 
 
 def _ensure_storage_object_exists(attachment: AssignmentSubmissionAttachment, *, attachment_id: int) -> None:
     try:
-        get_storage_backend().head_object(attachment.storage_key)
+        _storage_backend_for_attachment(attachment).head_object(attachment.storage_key)
     except ObjectNotFoundError as exc:
         raise _attachment_not_found_error(attachment_id) from exc
 
 
-def _delete_object_immediately(storage_key: str) -> bool:
+def _delete_object_immediately(storage_key: str, *, storage_provider: str | None = None, bucket_name: str | None = None) -> bool:
     try:
-        get_storage_backend().delete_object(storage_key)
+        _storage_backend_for_metadata(storage_provider, bucket_name).delete_object(storage_key)
         return True
     except Exception:
         return False
 
 
-def _delete_or_enqueue_object(db: Session, attachment: AssignmentSubmissionAttachment, *, reason: str) -> None:
+def _delete_or_enqueue_object(db: Session, attachment: AssignmentSubmissionAttachment, *, reason: str) -> bool:
     if _enqueue_object_deletion_job(db, attachment, reason=reason):
-        return
-    _delete_object_immediately(attachment.storage_key)
+        return True
+    _delete_object_immediately(
+        attachment.storage_key,
+        storage_provider=getattr(attachment, "storage_provider", None),
+        bucket_name=getattr(attachment, "bucket_name", None),
+    )
+    return False
 
 
 def _enqueue_object_deletion_job(db: Session, attachment: AssignmentSubmissionAttachment, *, reason: str) -> bool:
@@ -622,19 +663,28 @@ def _enqueue_object_deletion_job(db: Session, attachment: AssignmentSubmissionAt
     try:
         if not inspect(bind).has_table("object_deletion_jobs"):
             return False
-        backend = get_storage_backend()
+        storage_provider = getattr(attachment, "storage_provider", None) or _current_storage_metadata()[0]
+        bucket_name = getattr(attachment, "bucket_name", None) or _current_storage_metadata()[1]
         db.execute(
             text(
                 """
                 INSERT INTO object_deletion_jobs
                     (storage_provider, bucket_name, storage_key, owner_domain, owner_id, reason, status, attempt_count)
-                VALUES
-                    (:storage_provider, :bucket_name, :storage_key, :owner_domain, :owner_id, :reason, 'pending', 0)
+                SELECT
+                    :storage_provider, :bucket_name, :storage_key, :owner_domain, :owner_id, :reason, 'pending', 0
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM object_deletion_jobs
+                    WHERE storage_provider = :storage_provider
+                      AND bucket_name = :bucket_name
+                      AND storage_key = :storage_key
+                      AND status IN ('pending', 'processing')
+                )
                 """
             ),
             {
-                "storage_provider": backend.provider,
-                "bucket_name": backend.bucket_name,
+                "storage_provider": storage_provider,
+                "bucket_name": bucket_name,
                 "storage_key": attachment.storage_key,
                 "owner_domain": "assignment_submission_attachment",
                 "owner_id": attachment.id,
@@ -655,7 +705,7 @@ def process_object_deletion_jobs(db: Session, *, limit: int = 100) -> dict:
         rows = db.execute(
             text(
                 """
-                SELECT id, storage_key
+                SELECT id, storage_provider, bucket_name, storage_key
                 FROM object_deletion_jobs
                 WHERE status IN ('pending', 'failed')
                 ORDER BY created_at ASC, id ASC
@@ -672,7 +722,7 @@ def process_object_deletion_jobs(db: Session, *, limit: int = 100) -> dict:
     failed = 0
     for row in rows:
         try:
-            get_storage_backend().delete_object(row["storage_key"])
+            _storage_backend_for_metadata(row.get("storage_provider"), row.get("bucket_name")).delete_object(row["storage_key"])
             db.execute(
                 text(
                     """

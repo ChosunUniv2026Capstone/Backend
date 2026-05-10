@@ -136,7 +136,10 @@ class AssignmentSubmissionAttachment(Base):
     stored_filename: Mapped[str] = mapped_column(String(255))
     mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
     file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
     storage_key: Mapped[str] = mapped_column(String(500))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

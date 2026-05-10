@@ -28,7 +28,7 @@ from app.auth import (
     verify_access_token,
 )
 from app.config import get_settings
-from app.storage import RangeNotSatisfiableError, get_storage_backend, parse_http_range
+from app.storage import RangeNotSatisfiableError, get_storage_backend_for_metadata, parse_http_range
 from app.db import SessionLocal, get_db
 from app.attendance import (
     attendance_event_payload,
@@ -135,7 +135,10 @@ def _download_content_disposition(filename: str) -> str:
 
 
 def _stream_storage_download(download, range_header: str | None = None) -> StreamingResponse:
-    storage = get_storage_backend()
+    storage = get_storage_backend_for_metadata(
+        getattr(download, "storage_provider", None),
+        getattr(download, "bucket_name", None),
+    )
     try:
         metadata = storage.head_object(download.storage_key)
         requested_range = parse_http_range(range_header, object_size=metadata.size)

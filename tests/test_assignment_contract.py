@@ -195,14 +195,62 @@ def test_assignment_replacement_uses_deletion_outbox_when_available(
         files=[UploadFile(file=BytesIO(b"second"), filename="second.txt")],
     )
 
-    queued = db_session.execute(text("SELECT storage_key, status FROM object_deletion_jobs")).mappings().one()
+    queued = db_session.execute(
+        text("SELECT storage_provider, bucket_name, storage_key, status FROM object_deletion_jobs")
+    ).mappings().one()
+    assert queued["storage_provider"] == "local"
+    assert queued["bucket_name"] == "local"
     assert queued["storage_key"] == old_attachment.storage_key
-    assert queued["status"] == "pending"
-    assert old_path.exists()
+    assert queued["status"] == "completed"
+    assert not old_path.exists()
+
+    result = assignments_module.process_object_deletion_jobs(db_session)
+
+    assert result == {"processed": 0, "deleted": 0, "failed": 0, "skipped": False}
+
+
+def test_deletion_worker_uses_job_provider_and_bucket(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[tuple[str | None, str | None, str]] = []
+
+    class RecordingBackend:
+        def __init__(self, provider: str | None, bucket_name: str | None) -> None:
+            self.provider = provider or "local"
+            self.bucket_name = bucket_name
+
+        def delete_object(self, key: str) -> None:
+            deleted.append((self.provider, self.bucket_name, key))
+
+    db_session.execute(text("""
+        CREATE TABLE object_deletion_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            storage_provider TEXT NOT NULL,
+            bucket_name TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            owner_domain TEXT NOT NULL,
+            owner_id INTEGER NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP NULL
+        )
+    """))
+    db_session.execute(text("""
+        INSERT INTO object_deletion_jobs
+            (storage_provider, bucket_name, storage_key, owner_domain, reason)
+        VALUES
+            ('s3', 'smart-class-alt', 'assignments/provider-aware.txt', 'assignment_submission_attachment', 'test')
+    """))
+    db_session.commit()
+    monkeypatch.setattr(
+        assignments_module,
+        "get_storage_backend_for_metadata",
+        lambda provider, bucket_name: RecordingBackend(provider, bucket_name),
+    )
 
     result = assignments_module.process_object_deletion_jobs(db_session)
 
     assert result == {"processed": 1, "deleted": 1, "failed": 0, "skipped": False}
-    assert not old_path.exists()
-    completed = db_session.execute(text("SELECT status FROM object_deletion_jobs")).scalar_one()
-    assert completed == "completed"
+    assert deleted == [("s3", "smart-class-alt", "assignments/provider-aware.txt")]
+    assert db_session.execute(text("SELECT status FROM object_deletion_jobs")).scalar_one() == "completed"
