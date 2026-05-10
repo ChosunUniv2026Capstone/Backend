@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.3.0...v0.4.0) (2026-05-10)
+
+
+### Features
+
+* **backend:** enforce proxy-owned object storage ([7b9bc9f](https://github.com/ChosunUniv2026Capstone/Backend/commit/7b9bc9fd30ffa1d1b0dbea39fcf270326258137a))
+
 ## [0.3.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.2.0...v0.3.0) (2026-05-10)
 
 
