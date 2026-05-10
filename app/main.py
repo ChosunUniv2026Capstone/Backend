@@ -1,10 +1,11 @@
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,7 @@ from app.auth import (
     verify_access_token,
 )
 from app.config import get_settings
+from app.storage import RangeNotSatisfiableError, get_storage_backend, parse_http_range
 from app.db import SessionLocal, get_db
 from app.attendance import (
     attendance_event_payload,
@@ -123,6 +125,48 @@ from app.services import (
 
 settings = get_settings()
 presence_client = PresenceClient(settings.presence_service_url)
+
+
+def _download_content_disposition(filename: str) -> str:
+    quoted = quote(filename)
+    fallback = filename.encode("ascii", "ignore").decode("ascii") or "download"
+    fallback = fallback.replace('"', "")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quoted}"
+
+
+def _stream_storage_download(download, range_header: str | None = None) -> StreamingResponse:
+    storage = get_storage_backend()
+    try:
+        metadata = storage.head_object(download.storage_key)
+        requested_range = parse_http_range(range_header, object_size=metadata.size)
+        object_stream = (
+            storage.get_object_range(download.storage_key, start=requested_range[0], end=requested_range[1])
+            if requested_range
+            else storage.get_object(download.storage_key)
+        )
+    except RangeNotSatisfiableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail={"code": "OBJECT_RANGE_NOT_SATISFIABLE", "message": "requested range cannot be served", "details": {}},
+        ) from exc
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": _download_content_disposition(download.filename),
+    }
+    response_status = status.HTTP_200_OK
+    content_length = metadata.size
+    if object_stream.range_start is not None and object_stream.range_end is not None:
+        response_status = status.HTTP_206_PARTIAL_CONTENT
+        content_length = object_stream.range_end - object_stream.range_start + 1
+        headers["Content-Range"] = f"bytes {object_stream.range_start}-{object_stream.range_end}/{metadata.size}"
+    headers["Content-Length"] = str(content_length)
+    return StreamingResponse(
+        object_stream.body,
+        status_code=response_status,
+        media_type=download.media_type or object_stream.content_type or "application/octet-stream",
+        headers=headers,
+    )
 
 
 def _cors_origins() -> list[str]:
@@ -909,18 +953,19 @@ def download_student_assignment_attachment(
     course_code: str,
     assignment_id: int,
     attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     student, course = require_student_course_access(student_id, course_code, current_user, db)
-    path, filename, media_type = get_student_assignment_attachment_download(
+    download = get_student_assignment_attachment_download(
         db,
         student_user_id=student.id,
         course_id=course.id,
         assignment_id=assignment_id,
         attachment_id=attachment_id,
     )
-    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
+    return _stream_storage_download(download, range_header)
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/assignments/{assignment_id}/attachments/{attachment_id}")
@@ -929,17 +974,18 @@ def download_professor_assignment_attachment(
     course_code: str,
     assignment_id: int,
     attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
-    path, filename, media_type = get_professor_assignment_attachment_download(
+    download = get_professor_assignment_attachment_download(
         db,
         course_id=course.id,
         assignment_id=assignment_id,
         attachment_id=attachment_id,
     )
-    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
+    return _stream_storage_download(download, range_header)
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/exams", response_model=list[StudentExamSummaryRead])

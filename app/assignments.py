@@ -1,17 +1,20 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 import os
 import re
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import Assignment, AssignmentSubmission, AssignmentSubmissionAttachment, CourseEnrollment, User
+from app.storage import ObjectNotFoundError, get_storage_backend, spool_limited_upload
 
 settings = get_settings()
+ASSIGNMENT_STORAGE_PREFIX = "assignments"
 FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 MAX_ASSIGNMENT_TITLE_LENGTH = 200
 MAX_ORIGINAL_FILENAME_LENGTH = 255
@@ -109,14 +112,24 @@ def _sanitize_filename(filename: str | None) -> str:
     return sanitized[:180] or "attachment"
 
 
-def _attachment_root() -> Path:
-    root = Path(settings.assignment_upload_dir).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+@dataclass(frozen=True)
+class AssignmentAttachmentDownload:
+    storage_key: str
+    filename: str
+    media_type: str | None
+    file_size_bytes: int
 
 
-def _attachment_path(storage_key: str) -> Path:
-    return _attachment_root() / storage_key
+def _assignment_storage_key(*, assignment_id: int, submission_id: int, student_user_id: int, stored_filename: str) -> str:
+    return os.path.join(
+        ASSIGNMENT_STORAGE_PREFIX,
+        str(assignment_id),
+        "submissions",
+        str(submission_id),
+        "students",
+        str(student_user_id),
+        stored_filename,
+    )
 
 
 def _serialize_attachment(attachment: AssignmentSubmissionAttachment) -> dict:
@@ -363,50 +376,48 @@ def _store_upload_file(
     upload: UploadFile,
     *,
     assignment_id: int,
+    submission_id: int,
     student_user_id: int,
 ) -> dict:
     original_filename = _normalize_original_filename(upload.filename)
     sanitized_name = _sanitize_filename(original_filename)
     stored_filename = f"{uuid4().hex}_{sanitized_name}"
-    storage_key = os.path.join(
-        f"assignment-{assignment_id}",
-        f"student-{student_user_id}",
-        stored_filename,
+    storage_key = _assignment_storage_key(
+        assignment_id=assignment_id,
+        submission_id=submission_id,
+        student_user_id=student_user_id,
+        stored_filename=stored_filename,
     )
-    target_path = _attachment_path(storage_key)
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    mime_type = upload.content_type or "application/octet-stream"
 
-    file_size = 0
-    with target_path.open("wb") as handle:
-        while True:
-            chunk = upload.file.read(1024 * 1024)
-            if not chunk:
-                break
-            file_size += len(chunk)
-            if file_size > settings.assignment_upload_max_file_size_bytes:
-                handle.close()
-                target_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "ASSIGNMENT_SUBMISSION_FILE_TOO_LARGE",
-                        "message": "assignment submission file is too large",
-                        "details": {
-                            "filename": upload.filename or sanitized_name,
-                            "max_file_size_bytes": settings.assignment_upload_max_file_size_bytes,
-                        },
-                    },
-                )
-            handle.write(chunk)
+    try:
+        spooled_file, file_size = spool_limited_upload(
+            upload,
+            max_bytes=settings.assignment_upload_max_file_size_bytes,
+            chunk_size=settings.object_storage_proxy_chunk_size_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ASSIGNMENT_SUBMISSION_FILE_TOO_LARGE",
+                "message": "assignment submission file is too large",
+                "details": {
+                    "filename": upload.filename or sanitized_name,
+                    "max_file_size_bytes": settings.assignment_upload_max_file_size_bytes,
+                },
+            },
+        ) from exc
 
-    upload.file.close()
+    with spooled_file:
+        get_storage_backend().put_object(storage_key, spooled_file, content_type=mime_type)
+
     return {
         "original_filename": original_filename,
         "stored_filename": stored_filename,
-        "mime_type": upload.content_type or "application/octet-stream",
+        "mime_type": mime_type,
         "file_size_bytes": file_size,
         "storage_key": storage_key,
-        "path": target_path,
     }
 
 
@@ -482,6 +493,7 @@ def submit_student_assignment(
                 _store_upload_file(
                     upload,
                     assignment_id=assignment.id,
+                    submission_id=submission.id,
                     student_user_id=student_user_id,
                 )
             )
@@ -511,12 +523,12 @@ def submit_student_assignment(
     except Exception:
         db.rollback()
         for written in written_files:
-            written["path"].unlink(missing_ok=True)
+            _delete_object_immediately(written["storage_key"])
         raise
 
     if normalized_files:
         for existing in existing_attachments:
-            _attachment_path(existing.storage_key).unlink(missing_ok=True)
+            _delete_or_enqueue_object(db, existing, reason="assignment_attachment_replaced")
 
     return get_student_assignment_detail(
         db,
@@ -533,7 +545,7 @@ def get_student_assignment_attachment_download(
     course_id: int,
     assignment_id: int,
     attachment_id: int,
-) -> tuple[Path, str, str | None]:
+) -> AssignmentAttachmentDownload:
     _load_assignment(db, course_id=course_id, assignment_id=assignment_id)
     attachment = db.scalar(
         select(AssignmentSubmissionAttachment)
@@ -547,10 +559,13 @@ def get_student_assignment_attachment_download(
     if attachment is None:
         raise _attachment_not_found_error(attachment_id)
 
-    path = _attachment_path(attachment.storage_key)
-    if not path.exists():
-        raise _attachment_not_found_error(attachment_id)
-    return path, attachment.original_filename, attachment.mime_type
+    _ensure_storage_object_exists(attachment, attachment_id=attachment_id)
+    return AssignmentAttachmentDownload(
+        storage_key=attachment.storage_key,
+        filename=attachment.original_filename,
+        media_type=attachment.mime_type,
+        file_size_bytes=attachment.file_size_bytes,
+    )
 
 
 def get_professor_assignment_attachment_download(
@@ -559,7 +574,7 @@ def get_professor_assignment_attachment_download(
     course_id: int,
     assignment_id: int,
     attachment_id: int,
-) -> tuple[Path, str, str | None]:
+) -> AssignmentAttachmentDownload:
     _load_assignment(db, course_id=course_id, assignment_id=assignment_id)
     attachment = db.scalar(
         select(AssignmentSubmissionAttachment)
@@ -572,7 +587,114 @@ def get_professor_assignment_attachment_download(
     if attachment is None:
         raise _attachment_not_found_error(attachment_id)
 
-    path = _attachment_path(attachment.storage_key)
-    if not path.exists():
-        raise _attachment_not_found_error(attachment_id)
-    return path, attachment.original_filename, attachment.mime_type
+    _ensure_storage_object_exists(attachment, attachment_id=attachment_id)
+    return AssignmentAttachmentDownload(
+        storage_key=attachment.storage_key,
+        filename=attachment.original_filename,
+        media_type=attachment.mime_type,
+        file_size_bytes=attachment.file_size_bytes,
+    )
+
+
+def _ensure_storage_object_exists(attachment: AssignmentSubmissionAttachment, *, attachment_id: int) -> None:
+    try:
+        get_storage_backend().head_object(attachment.storage_key)
+    except ObjectNotFoundError as exc:
+        raise _attachment_not_found_error(attachment_id) from exc
+
+
+def _delete_object_immediately(storage_key: str) -> bool:
+    try:
+        get_storage_backend().delete_object(storage_key)
+        return True
+    except Exception:
+        return False
+
+
+def _delete_or_enqueue_object(db: Session, attachment: AssignmentSubmissionAttachment, *, reason: str) -> None:
+    if _enqueue_object_deletion_job(db, attachment, reason=reason):
+        return
+    _delete_object_immediately(attachment.storage_key)
+
+
+def _enqueue_object_deletion_job(db: Session, attachment: AssignmentSubmissionAttachment, *, reason: str) -> bool:
+    bind = db.get_bind()
+    try:
+        if not inspect(bind).has_table("object_deletion_jobs"):
+            return False
+        backend = get_storage_backend()
+        db.execute(
+            text(
+                """
+                INSERT INTO object_deletion_jobs
+                    (storage_provider, bucket_name, storage_key, owner_domain, owner_id, reason, status, attempt_count)
+                VALUES
+                    (:storage_provider, :bucket_name, :storage_key, :owner_domain, :owner_id, :reason, 'pending', 0)
+                """
+            ),
+            {
+                "storage_provider": backend.provider,
+                "bucket_name": backend.bucket_name,
+                "storage_key": attachment.storage_key,
+                "owner_domain": "assignment_submission_attachment",
+                "owner_id": attachment.id,
+                "reason": reason,
+            },
+        )
+        db.commit()
+        return True
+    except SQLAlchemyError:
+        db.rollback()
+        return False
+
+
+def process_object_deletion_jobs(db: Session, *, limit: int = 100) -> dict:
+    try:
+        if not inspect(db.get_bind()).has_table("object_deletion_jobs"):
+            return {"processed": 0, "deleted": 0, "failed": 0, "skipped": True}
+        rows = db.execute(
+            text(
+                """
+                SELECT id, storage_key
+                FROM object_deletion_jobs
+                WHERE status IN ('pending', 'failed')
+                ORDER BY created_at ASC, id ASC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).mappings().all()
+    except SQLAlchemyError:
+        db.rollback()
+        return {"processed": 0, "deleted": 0, "failed": 0, "skipped": True}
+
+    deleted = 0
+    failed = 0
+    for row in rows:
+        try:
+            get_storage_backend().delete_object(row["storage_key"])
+            db.execute(
+                text(
+                    """
+                    UPDATE object_deletion_jobs
+                    SET status = 'completed', completed_at = CURRENT_TIMESTAMP, last_error = NULL
+                    WHERE id = :id
+                    """
+                ),
+                {"id": row["id"]},
+            )
+            deleted += 1
+        except Exception as exc:
+            db.execute(
+                text(
+                    """
+                    UPDATE object_deletion_jobs
+                    SET status = 'failed', attempt_count = attempt_count + 1, last_error = :last_error
+                    WHERE id = :id
+                    """
+                ),
+                {"id": row["id"], "last_error": str(exc)[:500]},
+            )
+            failed += 1
+    db.commit()
+    return {"processed": len(rows), "deleted": deleted, "failed": failed, "skipped": False}
