@@ -39,6 +39,16 @@ class NoticeCreate(BaseModel):
     course_code: str | None = None
 
 
+class StoredObjectAttachmentRead(BaseModel):
+    id: int
+    original_filename: str
+    mime_type: str | None = None
+    file_size_bytes: int
+    uploaded_at: datetime | None = None
+    storage_provider: str | None = None
+    bucket_name: str | None = None
+
+
 class NoticeRead(BaseModel):
     id: int
     title: str
@@ -46,6 +56,7 @@ class NoticeRead(BaseModel):
     course_code: str | None = None
     author_name: str
     created_at: datetime | None = None
+    attachments: list[StoredObjectAttachmentRead] = Field(default_factory=list)
 
 
 class NoticeListResponse(BaseModel):
@@ -75,6 +86,27 @@ class AssignmentAttachmentRead(BaseModel):
     mime_type: str | None = None
     file_size_bytes: int
     uploaded_at: datetime | None = None
+    storage_provider: str | None = None
+    bucket_name: str | None = None
+
+
+class LearningItemAttachmentRead(StoredObjectAttachmentRead):
+    purpose: str | None = None
+
+
+class LearningItemRead(BaseModel):
+    id: int
+    course_code: str
+    kind: Literal["material", "video"]
+    title: str
+    description: str | None = None
+    week_label: str | None = None
+    format_label: str | None = None
+    author_name: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    attachments: list[LearningItemAttachmentRead] = Field(default_factory=list)
+    duration_label: str | None = None
 
 
 class StudentAssignmentSubmissionRead(BaseModel):
@@ -189,6 +221,7 @@ class StudentExamQuestionRead(BaseModel):
     is_required: bool = True
     selected_option_id: int | None = None
     options: list[ExamQuestionOptionRead] = Field(default_factory=list)
+    attachments: list["ExamMediaAttachmentRead"] = Field(default_factory=list)
 
 
 class StudentExamDetailRead(StudentExamSummaryRead):
@@ -289,12 +322,25 @@ class StudentExamSaveAnswerRead(BaseModel):
     answered_at: datetime | None = None
 
 
+class ExamMediaAttachmentRead(StoredObjectAttachmentRead):
+    question_id: int | None = None
+    answer_id: int | None = None
+    purpose: str | None = None
+
+
 class StudentExamSubmitResultRead(BaseModel):
     exam_id: int
     attempt: StudentExamAttemptRead
     score: float | None = None
     total_count: int = 0
     answered_count: int = 0
+
+
+class ReportExportRead(StoredObjectAttachmentRead):
+    export_type: str
+    course_code: str
+    status: str = "ready"
+    generated_at: datetime | None = None
 
 
 class UserSummary(BaseModel):

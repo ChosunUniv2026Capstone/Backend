@@ -1,8 +1,11 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 import math
 import re
+from uuid import uuid4
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -14,18 +17,37 @@ from app.models import (
     CourseSchedule,
     Exam,
     ExamQuestion,
+    ExamQuestionAttachment,
     ExamQuestionOption,
     ExamSubmission,
     ExamSubmissionAnswer,
+    LearningItem,
+    LearningItemAttachment,
     Notice,
+    NoticeAttachment,
     RegisteredDevice,
+    ReportExport,
     User,
 )
 from app.presence_client import PresenceClient
 from app.schemas import DeviceCreate
+from app.config import get_settings
+from app.storage import get_storage_backend, get_storage_backend_for_metadata, spool_limited_upload
 
 MAC_PATTERN = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 MAX_DEVICES_PER_STUDENT = 5
+FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+settings = get_settings()
+
+
+@dataclass(frozen=True)
+class ObjectDownload:
+    storage_key: str
+    filename: str
+    media_type: str | None
+    file_size_bytes: int
+    storage_provider: str | None = None
+    bucket_name: str | None = None
 
 
 def normalize_mac(mac_address: str) -> str:
@@ -33,6 +55,93 @@ def normalize_mac(mac_address: str) -> str:
     if not MAC_PATTERN.match(normalized):
         raise HTTPException(status_code=400, detail="invalid MAC address format")
     return normalized
+
+
+def _normalize_original_filename(filename: str | None) -> str:
+    candidate = (filename or "attachment").replace("\x00", "").strip()
+    if not candidate:
+        candidate = "attachment"
+    return candidate.replace("/", "_").replace("\\", "_")[:255] or "attachment"
+
+
+def _sanitize_filename(filename: str | None) -> str:
+    sanitized = FILENAME_SANITIZE_PATTERN.sub("_", _normalize_original_filename(filename))
+    return sanitized[:180] or "attachment"
+
+
+def _current_storage_metadata() -> tuple[str, str]:
+    backend = get_storage_backend()
+    provider = backend.provider if backend.provider in {"local", "s3"} else "local"
+    bucket_name = backend.bucket_name or ("local" if provider == "local" else settings.object_storage_bucket)
+    return provider, bucket_name
+
+
+def _store_domain_upload(upload: UploadFile, *, prefix: str) -> dict:
+    original_filename = _normalize_original_filename(upload.filename)
+    stored_filename = f"{uuid4().hex}_{_sanitize_filename(original_filename)}"
+    storage_key = f"{prefix.rstrip('/')}/{stored_filename}"
+    mime_type = upload.content_type or "application/octet-stream"
+    try:
+        spooled_file, file_size = spool_limited_upload(
+            upload,
+            max_bytes=settings.assignment_upload_max_file_size_bytes,
+            chunk_size=settings.object_storage_proxy_chunk_size_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "OBJECT_UPLOAD_TOO_LARGE",
+                "message": "uploaded file is too large",
+                "details": {"filename": original_filename, "max_file_size_bytes": settings.assignment_upload_max_file_size_bytes},
+            },
+        ) from exc
+    with spooled_file:
+        get_storage_backend().put_object(storage_key, spooled_file, content_type=mime_type)
+    storage_provider, bucket_name = _current_storage_metadata()
+    return {
+        "original_filename": original_filename,
+        "stored_filename": stored_filename,
+        "mime_type": mime_type,
+        "file_size_bytes": file_size,
+        "storage_provider": storage_provider,
+        "bucket_name": bucket_name,
+        "storage_key": storage_key,
+    }
+
+
+def _store_bytes_object(*, content: bytes, filename: str, mime_type: str, prefix: str) -> dict:
+    original_filename = _normalize_original_filename(filename)
+    stored_filename = f"{uuid4().hex}_{_sanitize_filename(original_filename)}"
+    storage_key = f"{prefix.rstrip('/')}/{stored_filename}"
+    get_storage_backend().put_object(storage_key, BytesIO(content), content_type=mime_type)
+    storage_provider, bucket_name = _current_storage_metadata()
+    return {
+        "original_filename": original_filename,
+        "stored_filename": stored_filename,
+        "mime_type": mime_type,
+        "file_size_bytes": len(content),
+        "storage_provider": storage_provider,
+        "bucket_name": bucket_name,
+        "storage_key": storage_key,
+    }
+
+
+def _attachment_payload(attachment, *, purpose: str | None = None, question_id: int | None = None) -> dict:
+    payload = {
+        "id": attachment.id,
+        "original_filename": attachment.original_filename,
+        "mime_type": attachment.mime_type,
+        "file_size_bytes": attachment.file_size_bytes,
+        "uploaded_at": attachment.created_at,
+        "storage_provider": getattr(attachment, "storage_provider", None),
+        "bucket_name": getattr(attachment, "bucket_name", None),
+    }
+    if purpose is not None:
+        payload["purpose"] = purpose
+    if question_id is not None:
+        payload["question_id"] = question_id
+    return payload
 
 
 def list_devices(db: Session, student_id: str) -> list[RegisteredDevice]:
@@ -329,6 +438,24 @@ def list_student_exams(db: Session, student_user_id: int, course_id: int) -> lis
     return [serialize_summary(exam, attempts_used=attempt_counts.get(exam.id, 0), submission=get_latest_submission(exam.id)) for exam in exams]
 
 
+def _exam_question_attachment_index(db: Session, question_ids: list[int]) -> dict[int, list[dict]]:
+    if not question_ids:
+        return {}
+    attachments = list(
+        db.scalars(
+            select(ExamQuestionAttachment)
+            .where(ExamQuestionAttachment.question_id.in_(question_ids))
+            .order_by(ExamQuestionAttachment.question_id.asc(), ExamQuestionAttachment.created_at.asc(), ExamQuestionAttachment.id.asc())
+        )
+    )
+    index: dict[int, list[dict]] = {}
+    for attachment in attachments:
+        index.setdefault(attachment.question_id, []).append(
+            _attachment_payload(attachment, purpose=attachment.attachment_role, question_id=attachment.question_id)
+        )
+    return index
+
+
 def get_student_exam_detail(db: Session, student_user_id: int, course_id: int, exam_id: int) -> dict:
     student_visible_statuses = ("published", "open", "closed")
 
@@ -399,6 +526,7 @@ def get_student_exam_detail(db: Session, student_user_id: int, course_id: int, e
                 select(ExamSubmissionAnswer).where(ExamSubmissionAnswer.submission_id == latest_submission.id)
             )
         )
+        attachment_index = _exam_question_attachment_index(db, question_ids)
         option_index: dict[int, list[dict]] = {}
         answer_index = {answer.question_id: answer for answer in answers}
         for option in options:
@@ -420,6 +548,7 @@ def get_student_exam_detail(db: Session, student_user_id: int, course_id: int, e
                 "is_required": question.is_required,
                 "selected_option_id": answer_index.get(question.id).selected_option_id if question.id in answer_index else None,
                 "options": option_index.get(question.id, []),
+                "attachments": attachment_index.get(question.id, []),
             }
             for index, question in enumerate(loaded_questions, start=1)
         ]
@@ -699,6 +828,7 @@ def get_professor_exam_detail(
                 "is_correct": option.is_correct,
             }
         )
+    attachment_index = _exam_question_attachment_index(db, option_ids)
 
     summary = next(
         exam_summary
@@ -719,6 +849,7 @@ def get_professor_exam_detail(
                 "is_required": question.is_required,
                 "selected_option_id": None,
                 "options": option_index.get(question.id, []),
+                "attachments": attachment_index.get(question.id, []),
             }
             for question in questions
         ],
@@ -855,6 +986,78 @@ def publish_professor_exam(
     db.commit()
     db.refresh(exam)
     return get_professor_exam_detail(db=db, course_id=course_id, exam_id=exam.id)
+
+
+def upload_exam_question_attachments(
+    db: Session,
+    *,
+    course_id: int,
+    exam_id: int,
+    question_id: int,
+    files: list[UploadFile],
+) -> list[dict]:
+    question = db.scalar(
+        select(ExamQuestion)
+        .join(Exam, Exam.id == ExamQuestion.exam_id)
+        .where(Exam.id == exam_id, Exam.course_id == course_id, ExamQuestion.id == question_id)
+    )
+    if question is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "EXAM_NOT_FOUND", "message": "question not found in this exam", "details": {"question_id": question_id}},
+        )
+    written_files: list[dict] = []
+    try:
+        for upload in [item for item in files if item.filename]:
+            written_files.append(_store_domain_upload(upload, prefix=f"exams/{exam_id}/questions/{question_id}"))
+        attachments: list[ExamQuestionAttachment] = []
+        for written in written_files:
+            attachment = ExamQuestionAttachment(question_id=question.id, attachment_role="prompt", **written)
+            db.add(attachment)
+            attachments.append(attachment)
+        db.commit()
+        for attachment in attachments:
+            db.refresh(attachment)
+        return [_attachment_payload(attachment, purpose=attachment.attachment_role, question_id=attachment.question_id) for attachment in attachments]
+    except Exception:
+        db.rollback()
+        for written in written_files:
+            get_storage_backend_for_metadata(written["storage_provider"], written["bucket_name"]).delete_object(written["storage_key"])
+        raise
+
+
+def get_exam_question_attachment_download(
+    db: Session,
+    *,
+    course_id: int,
+    exam_id: int,
+    question_id: int,
+    attachment_id: int,
+) -> ObjectDownload:
+    attachment = db.scalar(
+        select(ExamQuestionAttachment)
+        .join(ExamQuestion, ExamQuestion.id == ExamQuestionAttachment.question_id)
+        .join(Exam, Exam.id == ExamQuestion.exam_id)
+        .where(
+            Exam.id == exam_id,
+            Exam.course_id == course_id,
+            ExamQuestion.id == question_id,
+            ExamQuestionAttachment.id == attachment_id,
+        )
+    )
+    if attachment is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "EXAM_ATTACHMENT_NOT_FOUND", "message": "exam attachment not found", "details": {"attachment_id": attachment_id}},
+        )
+    return ObjectDownload(
+        storage_key=attachment.storage_key,
+        filename=attachment.original_filename,
+        media_type=attachment.mime_type,
+        file_size_bytes=attachment.file_size_bytes,
+        storage_provider=attachment.storage_provider,
+        bucket_name=attachment.bucket_name,
+    )
 
 
 def _finalize_exam_submission(
@@ -1368,7 +1571,19 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
             },
         )
 
-    rows = db.execute(stmt)
+    rows = list(db.execute(stmt))
+    notice_ids = [row[0] for row in rows]
+    attachment_index: dict[int, list[dict]] = {}
+    if notice_ids:
+        attachments = list(
+            db.scalars(
+                select(NoticeAttachment)
+                .where(NoticeAttachment.notice_id.in_(notice_ids))
+                .order_by(NoticeAttachment.notice_id.asc(), NoticeAttachment.created_at.asc(), NoticeAttachment.id.asc())
+            )
+        )
+        for attachment in attachments:
+            attachment_index.setdefault(attachment.notice_id, []).append(_attachment_payload(attachment))
     return [
         {
             "id": row[0],
@@ -1377,6 +1592,7 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
             "course_code": row[3],
             "author_name": row[4],
             "created_at": row[5],
+            "attachments": attachment_index.get(row[0], []),
         }
         for row in rows
     ]
@@ -1431,6 +1647,171 @@ def create_notice(db: Session, professor_id: str, title: str, body: str, course_
     return notice
 
 
+def create_notice_with_attachments(
+    db: Session,
+    professor_id: str,
+    title: str,
+    body: str,
+    course_code: str | None,
+    files: list[UploadFile],
+) -> Notice:
+    notice = create_notice(db, professor_id, title, body, course_code)
+    written_files: list[dict] = []
+    try:
+        for upload in [item for item in files if item.filename]:
+            written_files.append(_store_domain_upload(upload, prefix=f"notices/{notice.id}"))
+        for written in written_files:
+            db.add(NoticeAttachment(notice_id=notice.id, **written))
+        db.commit()
+        db.refresh(notice)
+        return notice
+    except Exception:
+        db.rollback()
+        for written in written_files:
+            get_storage_backend_for_metadata(written["storage_provider"], written["bucket_name"]).delete_object(written["storage_key"])
+        raise
+
+
+def get_notice_attachment_download(db: Session, login_id: str, notice_id: int, attachment_id: int) -> ObjectDownload:
+    get_notice_detail(db, login_id, notice_id)
+    attachment = db.scalar(
+        select(NoticeAttachment).where(
+            NoticeAttachment.id == attachment_id,
+            NoticeAttachment.notice_id == notice_id,
+        )
+    )
+    if attachment is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOTICE_ATTACHMENT_NOT_FOUND", "message": "notice attachment not found", "details": {"attachment_id": attachment_id}},
+        )
+    return ObjectDownload(
+        storage_key=attachment.storage_key,
+        filename=attachment.original_filename,
+        media_type=attachment.mime_type,
+        file_size_bytes=attachment.file_size_bytes,
+        storage_provider=attachment.storage_provider,
+        bucket_name=attachment.bucket_name,
+    )
+
+
+def list_learning_items_for_course(db: Session, *, course: Course, include_unpublished: bool = False) -> list[dict]:
+    stmt = (
+        select(LearningItem, User.name)
+        .join(User, User.id == LearningItem.created_by_user_id)
+        .where(LearningItem.course_id == course.id)
+        .order_by(LearningItem.sort_order.asc(), LearningItem.created_at.desc(), LearningItem.id.desc())
+    )
+    if not include_unpublished:
+        stmt = stmt.where(LearningItem.is_published.is_(True))
+    rows = list(db.execute(stmt))
+    item_ids = [row[0].id for row in rows]
+    attachment_index: dict[int, list[dict]] = {}
+    if item_ids:
+        attachments = list(
+            db.scalars(
+                select(LearningItemAttachment)
+                .where(LearningItemAttachment.learning_item_id.in_(item_ids))
+                .order_by(LearningItemAttachment.learning_item_id.asc(), LearningItemAttachment.created_at.asc(), LearningItemAttachment.id.asc())
+            )
+        )
+        for attachment in attachments:
+            item_kind = next((item.item_type for item, _ in rows if item.id == attachment.learning_item_id), None)
+            attachment_index.setdefault(attachment.learning_item_id, []).append(_attachment_payload(attachment, purpose=item_kind))
+    return [
+        {
+            "id": item.id,
+            "course_code": course.course_code,
+            "kind": "video" if item.item_type == "video" else "material",
+            "title": item.title,
+            "description": item.description,
+            "week_label": None,
+            "format_label": item.item_type,
+            "author_name": author_name,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "attachments": attachment_index.get(item.id, []),
+            "duration_label": None,
+        }
+        for item, author_name in rows
+    ]
+
+
+def create_learning_item(
+    db: Session,
+    *,
+    course: Course,
+    professor: User,
+    kind: str,
+    title: str,
+    description: str | None,
+    files: list[UploadFile],
+) -> dict:
+    item_kind = "video" if kind == "video" else "document"
+    item = LearningItem(
+        course_id=course.id,
+        created_by_user_id=professor.id,
+        title=title.strip(),
+        description=(description or "").strip() or None,
+        item_type=item_kind,
+        is_published=True,
+    )
+    db.add(item)
+    db.flush()
+    written_files: list[dict] = []
+    try:
+        for upload in [item for item in files if item.filename]:
+            written_files.append(_store_domain_upload(upload, prefix=f"learning/{course.course_code}/{item.id}"))
+        for written in written_files:
+            db.add(LearningItemAttachment(learning_item_id=item.id, **written))
+        db.commit()
+        return next(entry for entry in list_learning_items_for_course(db, course=course, include_unpublished=True) if entry["id"] == item.id)
+    except Exception:
+        db.rollback()
+        for written in written_files:
+            get_storage_backend_for_metadata(written["storage_provider"], written["bucket_name"]).delete_object(written["storage_key"])
+        raise
+
+
+def delete_learning_item(db: Session, *, course_id: int, learning_item_id: int) -> None:
+    item = db.scalar(select(LearningItem).where(LearningItem.id == learning_item_id, LearningItem.course_id == course_id))
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "LEARNING_ITEM_NOT_FOUND", "message": "learning item not found", "details": {"learning_item_id": learning_item_id}},
+        )
+    db.delete(item)
+    db.commit()
+
+
+def get_learning_attachment_download(db: Session, *, course: Course, learning_item_id: int, attachment_id: int) -> ObjectDownload:
+    item = db.scalar(select(LearningItem).where(LearningItem.id == learning_item_id, LearningItem.course_id == course.id))
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "LEARNING_ITEM_NOT_FOUND", "message": "learning item not found", "details": {"learning_item_id": learning_item_id}},
+        )
+    attachment = db.scalar(
+        select(LearningItemAttachment).where(
+            LearningItemAttachment.id == attachment_id,
+            LearningItemAttachment.learning_item_id == item.id,
+        )
+    )
+    if attachment is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "LEARNING_ATTACHMENT_NOT_FOUND", "message": "learning item attachment not found", "details": {"attachment_id": attachment_id}},
+        )
+    return ObjectDownload(
+        storage_key=attachment.storage_key,
+        filename=attachment.original_filename,
+        media_type=attachment.mime_type,
+        file_size_bytes=attachment.file_size_bytes,
+        storage_provider=attachment.storage_provider,
+        bucket_name=attachment.bucket_name,
+    )
+
+
 def list_users(db: Session) -> list[dict]:
     rows = db.scalars(select(User).order_by(User.role.asc(), User.name.asc()))
     return [
@@ -1442,6 +1823,96 @@ def list_users(db: Session) -> list[dict]:
         }
         for user in rows
     ]
+
+
+def create_attendance_csv_export(db: Session, *, professor_id: str, course_code: str) -> dict:
+    professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
+    course = db.scalar(select(Course).where(Course.course_code == course_code, Course.professor_user_id == getattr(professor, "id", None)))
+    if professor is None or course is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COURSE_NOT_FOUND", "message": "course not found", "details": {"course_code": course_code}},
+        )
+    generated_at = datetime.now(UTC)
+    filename = f"attendance-{course_code}-{generated_at.strftime('%Y%m%d%H%M%S')}.csv"
+    content = "course_code,generated_at\n" f"{course_code},{generated_at.isoformat()}\n"
+    written = _store_bytes_object(
+        content=content.encode("utf-8"),
+        filename=filename,
+        mime_type="text/csv",
+        prefix=f"reports/attendance/{course_code}/{generated_at:%Y/%m}",
+    )
+    report = ReportExport(
+        course_id=course.id,
+        requested_by_user_id=professor.id,
+        report_domain="attendance",
+        export_format="csv",
+        status="ready",
+        generated_at=generated_at,
+        **written,
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return _report_export_payload(report, course.course_code)
+
+
+def _report_export_payload(report: ReportExport, course_code: str) -> dict:
+    return {
+        "id": report.id,
+        "original_filename": report.original_filename,
+        "mime_type": report.mime_type,
+        "file_size_bytes": report.file_size_bytes,
+        "uploaded_at": report.created_at,
+        "storage_provider": report.storage_provider,
+        "bucket_name": report.bucket_name,
+        "export_type": f"{report.report_domain}_{report.export_format}",
+        "course_code": course_code,
+        "status": report.status,
+        "generated_at": report.generated_at,
+    }
+
+
+def list_attendance_csv_exports(db: Session, *, professor_id: str, course_code: str) -> list[dict]:
+    professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
+    course = db.scalar(select(Course).where(Course.course_code == course_code, Course.professor_user_id == getattr(professor, "id", None)))
+    if professor is None or course is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COURSE_NOT_FOUND", "message": "course not found", "details": {"course_code": course_code}},
+        )
+    reports = list(
+        db.scalars(
+            select(ReportExport)
+            .where(ReportExport.course_id == course.id, ReportExport.report_domain == "attendance")
+            .order_by(ReportExport.created_at.desc(), ReportExport.id.desc())
+        )
+    )
+    return [_report_export_payload(report, course.course_code) for report in reports]
+
+
+def get_report_export_download(db: Session, *, professor_id: str, course_code: str, export_id: int) -> ObjectDownload:
+    professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
+    course = db.scalar(select(Course).where(Course.course_code == course_code, Course.professor_user_id == getattr(professor, "id", None)))
+    if professor is None or course is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COURSE_NOT_FOUND", "message": "course not found", "details": {"course_code": course_code}},
+        )
+    report = db.scalar(select(ReportExport).where(ReportExport.id == export_id, ReportExport.course_id == course.id))
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "REPORT_EXPORT_NOT_FOUND", "message": "report export not found", "details": {"export_id": export_id}},
+        )
+    return ObjectDownload(
+        storage_key=report.storage_key,
+        filename=report.original_filename,
+        media_type=report.mime_type,
+        file_size_bytes=report.file_size_bytes,
+        storage_provider=report.storage_provider,
+        bucket_name=report.bucket_name,
+    )
 
 
 def list_classrooms(db: Session) -> list[dict]:
