@@ -2,12 +2,22 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.assignments import (
+    create_professor_assignment,
+    get_professor_assignment_attachment_download,
+    get_professor_assignment_detail,
+    get_student_assignment_attachment_download,
+    get_student_assignment_detail,
+    list_professor_assignments,
+    list_student_assignments,
+    submit_student_assignment,
+)
 from app.auth import (
     RefreshRotationBundle,
     auth_error,
@@ -57,6 +67,9 @@ from app.schemas import (
     DeviceCreate,
     DeviceRead,
     ExamSubmissionStartRead,
+    ProfessorAssignmentCreateRequest,
+    ProfessorAssignmentDetailRead,
+    ProfessorAssignmentSummaryRead,
     ProfessorExamDetailRead,
     ExamSummaryRead,
     HealthResponse,
@@ -71,6 +84,8 @@ from app.schemas import (
     StudentExamSubmitRequest,
     StudentExamSubmitResultRead,
     StudentExamSummaryRead,
+    StudentAssignmentDetailRead,
+    StudentAssignmentSummaryRead,
     UserSummary,
 )
 from app.services import (
@@ -770,6 +785,161 @@ def get_professor_courses(
 ) -> list[CourseRead]:
     require_professor_self(professor_id, current_user)
     return [CourseRead(**course) for course in list_professor_courses(db, professor_id)]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/assignments", response_model=list[StudentAssignmentSummaryRead])
+def get_student_course_assignments(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[StudentAssignmentSummaryRead]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return [
+        StudentAssignmentSummaryRead(**assignment)
+        for assignment in list_student_assignments(db, student_user_id=student.id, course_id=course.id)
+    ]
+
+
+@app.get(
+    "/api/students/{student_id}/courses/{course_code}/assignments/{assignment_id}",
+    response_model=StudentAssignmentDetailRead,
+)
+def get_student_course_assignment_detail(
+    student_id: str,
+    course_code: str,
+    assignment_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StudentAssignmentDetailRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return StudentAssignmentDetailRead(
+        **get_student_assignment_detail(
+            db,
+            student_user_id=student.id,
+            course_id=course.id,
+            assignment_id=assignment_id,
+        )
+    )
+
+
+@app.post(
+    "/api/students/{student_id}/courses/{course_code}/assignments/{assignment_id}/submission",
+    response_model=StudentAssignmentDetailRead,
+)
+def submit_student_course_assignment(
+    student_id: str,
+    course_code: str,
+    assignment_id: int,
+    submission_text: str | None = Form(default=None),
+    files: list[UploadFile] = File(default_factory=list),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StudentAssignmentDetailRead:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return StudentAssignmentDetailRead(
+        **submit_student_assignment(
+            db,
+            student_user_id=student.id,
+            course_id=course.id,
+            assignment_id=assignment_id,
+            submission_text=submission_text,
+            files=files,
+        )
+    )
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/assignments", response_model=list[ProfessorAssignmentSummaryRead])
+def get_professor_course_assignments(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[ProfessorAssignmentSummaryRead]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return [ProfessorAssignmentSummaryRead(**assignment) for assignment in list_professor_assignments(db, course_id=course.id)]
+
+
+@app.post(
+    "/api/professors/{professor_id}/courses/{course_code}/assignments",
+    response_model=ProfessorAssignmentDetailRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_professor_course_assignment(
+    professor_id: str,
+    course_code: str,
+    payload: ProfessorAssignmentCreateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorAssignmentDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorAssignmentDetailRead(
+        **create_professor_assignment(
+            db,
+            course_id=course.id,
+            payload=payload.model_dump(),
+        )
+    )
+
+
+@app.get(
+    "/api/professors/{professor_id}/courses/{course_code}/assignments/{assignment_id}",
+    response_model=ProfessorAssignmentDetailRead,
+)
+def get_professor_course_assignment_detail(
+    professor_id: str,
+    course_code: str,
+    assignment_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorAssignmentDetailRead:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorAssignmentDetailRead(
+        **get_professor_assignment_detail(
+            db,
+            course_id=course.id,
+            assignment_id=assignment_id,
+        )
+    )
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/assignments/{assignment_id}/attachments/{attachment_id}")
+def download_student_assignment_attachment(
+    student_id: str,
+    course_code: str,
+    assignment_id: int,
+    attachment_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    path, filename, media_type = get_student_assignment_attachment_download(
+        db,
+        student_user_id=student.id,
+        course_id=course.id,
+        assignment_id=assignment_id,
+        attachment_id=attachment_id,
+    )
+    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/assignments/{assignment_id}/attachments/{attachment_id}")
+def download_professor_assignment_attachment(
+    professor_id: str,
+    course_code: str,
+    assignment_id: int,
+    attachment_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    path, filename, media_type = get_professor_assignment_attachment_download(
+        db,
+        course_id=course.id,
+        assignment_id=assignment_id,
+        attachment_id=attachment_id,
+    )
+    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/exams", response_model=list[StudentExamSummaryRead])

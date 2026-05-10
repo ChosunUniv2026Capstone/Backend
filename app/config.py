@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     service_port: int = 8000
     database_url: str = "postgresql+psycopg://smartclass:smartclass@postgres:5432/smartclass"
     presence_service_url: str = "http://presence-service:8001"
+    assignment_upload_dir: str = "storage/assignments"
+    assignment_upload_max_files: int = 5
+    assignment_upload_max_file_size_bytes: int = 10 * 1024 * 1024
     cors_origins: str = "*"
     jwt_secret: str = "smart-class-dev-jwt-secret"
     access_token_ttl_seconds: int = 900
