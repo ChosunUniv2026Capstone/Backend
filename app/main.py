@@ -1,10 +1,11 @@
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,7 @@ from app.auth import (
     verify_access_token,
 )
 from app.config import get_settings
+from app.storage import ObjectNotFoundError, RangeNotSatisfiableError, get_storage_backend_for_metadata, parse_http_range
 from app.db import SessionLocal, get_db
 from app.attendance import (
     attendance_event_payload,
@@ -67,6 +69,7 @@ from app.schemas import (
     DeviceCreate,
     DeviceRead,
     ExamSubmissionStartRead,
+    ExamMediaAttachmentRead,
     ProfessorAssignmentCreateRequest,
     ProfessorAssignmentDetailRead,
     ProfessorAssignmentSummaryRead,
@@ -77,6 +80,7 @@ from app.schemas import (
     NoticeRead,
     NoticeListResponse,
     NoticeResponse,
+    LearningItemRead,
     ProfessorExamCreateRequest,
     StudentExamDetailRead,
     StudentExamSaveAnswerRead,
@@ -86,18 +90,27 @@ from app.schemas import (
     StudentExamSummaryRead,
     StudentAssignmentDetailRead,
     StudentAssignmentSummaryRead,
+    ReportExportRead,
     UserSummary,
 )
 from app.services import (
     authenticate_user,
     check_attendance_eligibility,
     close_professor_exam,
+    create_attendance_csv_export,
+    create_learning_item,
     create_professor_exam,
     create_device,
     delete_professor_exam,
+    delete_learning_item,
     create_notice,
+    create_notice_with_attachments,
     delete_device,
+    get_exam_question_attachment_download,
+    get_learning_attachment_download,
     get_notice_detail,
+    get_notice_attachment_download,
+    get_report_export_download,
     get_user_by_login_id,
     get_user_login_id,
     get_professor_exam_detail,
@@ -106,6 +119,8 @@ from app.services import (
     list_classroom_networks_for_classroom,
     list_classrooms,
     list_devices,
+    list_attendance_csv_exports,
+    list_learning_items_for_course,
     list_notices,
     list_presence_device_options,
     list_professor_exams,
@@ -113,6 +128,7 @@ from app.services import (
     list_student_exams,
     list_student_courses,
     publish_professor_exam,
+    upload_exam_question_attachments,
     save_student_exam_answer,
     submit_student_exam,
     start_student_exam,
@@ -123,6 +139,56 @@ from app.services import (
 
 settings = get_settings()
 presence_client = PresenceClient(settings.presence_service_url)
+
+
+def _download_content_disposition(filename: str) -> str:
+    quoted = quote(filename)
+    fallback = filename.encode("ascii", "ignore").decode("ascii") or "download"
+    fallback = fallback.replace('"', "")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quoted}"
+
+
+def _stream_storage_download(download, range_header: str | None = None) -> StreamingResponse:
+    storage = get_storage_backend_for_metadata(
+        getattr(download, "storage_provider", None),
+        getattr(download, "bucket_name", None),
+    )
+    try:
+        metadata = storage.head_object(download.storage_key)
+        requested_range = parse_http_range(range_header, object_size=metadata.size)
+        object_stream = (
+            storage.get_object_range(download.storage_key, start=requested_range[0], end=requested_range[1])
+            if requested_range
+            else storage.get_object(download.storage_key)
+        )
+    except RangeNotSatisfiableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail={"code": "OBJECT_RANGE_NOT_SATISFIABLE", "message": "requested range cannot be served", "details": {}},
+        ) from exc
+    except ObjectNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "OBJECT_NOT_FOUND", "message": "stored object was not found", "details": {}},
+        ) from exc
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": _download_content_disposition(download.filename),
+    }
+    response_status = status.HTTP_200_OK
+    content_length = metadata.size
+    if object_stream.range_start is not None and object_stream.range_end is not None:
+        response_status = status.HTTP_206_PARTIAL_CONTENT
+        content_length = object_stream.range_end - object_stream.range_start + 1
+        headers["Content-Range"] = f"bytes {object_stream.range_start}-{object_stream.range_end}/{metadata.size}"
+    headers["Content-Length"] = str(content_length)
+    return StreamingResponse(
+        object_stream.body,
+        status_code=response_status,
+        media_type=download.media_type or object_stream.content_type or "application/octet-stream",
+        headers=headers,
+    )
 
 
 def _cors_origins() -> list[str]:
@@ -909,18 +975,19 @@ def download_student_assignment_attachment(
     course_code: str,
     assignment_id: int,
     attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     student, course = require_student_course_access(student_id, course_code, current_user, db)
-    path, filename, media_type = get_student_assignment_attachment_download(
+    download = get_student_assignment_attachment_download(
         db,
         student_user_id=student.id,
         course_id=course.id,
         assignment_id=assignment_id,
         attachment_id=attachment_id,
     )
-    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
+    return _stream_storage_download(download, range_header)
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/assignments/{assignment_id}/attachments/{attachment_id}")
@@ -929,17 +996,96 @@ def download_professor_assignment_attachment(
     course_code: str,
     assignment_id: int,
     attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
-    path, filename, media_type = get_professor_assignment_attachment_download(
+    download = get_professor_assignment_attachment_download(
         db,
         course_id=course.id,
         assignment_id=assignment_id,
         attachment_id=attachment_id,
     )
-    return FileResponse(path, filename=filename, media_type=media_type or "application/octet-stream")
+    return _stream_storage_download(download, range_header)
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/learning-items", response_model=list[LearningItemRead])
+def get_student_learning_items(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[LearningItemRead]:
+    _, course = require_student_course_access(student_id, course_code, current_user, db)
+    return [LearningItemRead(**item) for item in list_learning_items_for_course(db, course=course)]
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/learning-items", response_model=list[LearningItemRead])
+def get_professor_learning_items(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[LearningItemRead]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return [LearningItemRead(**item) for item in list_learning_items_for_course(db, course=course, include_unpublished=True)]
+
+
+@app.post("/api/professors/{professor_id}/courses/{course_code}/learning-items", response_model=LearningItemRead, status_code=status.HTTP_201_CREATED)
+def add_professor_learning_item(
+    professor_id: str,
+    course_code: str,
+    kind: str = Form("material"),
+    title: str = Form(...),
+    description: str | None = Form(None),
+    files: list[UploadFile] = File(default_factory=list),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> LearningItemRead:
+    professor, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return LearningItemRead(**create_learning_item(db, course=course, professor=professor, kind=kind, title=title, description=description, files=files))
+
+
+@app.delete("/api/professors/{professor_id}/courses/{course_code}/learning-items/{learning_item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_professor_learning_item(
+    professor_id: str,
+    course_code: str,
+    learning_item_id: int,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    delete_learning_item(db, course_id=course.id, learning_item_id=learning_item_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/learning-items/{learning_item_id}/attachments/{attachment_id}")
+def download_student_learning_attachment(
+    student_id: str,
+    course_code: str,
+    learning_item_id: int,
+    attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _, course = require_student_course_access(student_id, course_code, current_user, db)
+    return _stream_storage_download(get_learning_attachment_download(db, course=course, learning_item_id=learning_item_id, attachment_id=attachment_id), range_header)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/learning-items/{learning_item_id}/attachments/{attachment_id}")
+def download_professor_learning_attachment(
+    professor_id: str,
+    course_code: str,
+    learning_item_id: int,
+    attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return _stream_storage_download(get_learning_attachment_download(db, course=course, learning_item_id=learning_item_id, attachment_id=attachment_id), range_header)
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/exams", response_model=list[StudentExamSummaryRead])
@@ -1099,6 +1245,63 @@ def close_professor_course_exam(
 
 
 @app.post(
+    "/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}/questions/{question_id}/attachments",
+    response_model=list[ExamMediaAttachmentRead],
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_professor_exam_question_media(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    question_id: int,
+    files: list[UploadFile] = File(default_factory=list),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[ExamMediaAttachmentRead]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return [
+        ExamMediaAttachmentRead(**item)
+        for item in upload_exam_question_attachments(db, course_id=course.id, exam_id=exam_id, question_id=question_id, files=files)
+    ]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/exams/{exam_id}/questions/{question_id}/attachments/{attachment_id}")
+def download_student_exam_question_media(
+    student_id: str,
+    course_code: str,
+    exam_id: int,
+    question_id: int,
+    attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _, course = require_student_course_access(student_id, course_code, current_user, db)
+    return _stream_storage_download(
+        get_exam_question_attachment_download(db, course_id=course.id, exam_id=exam_id, question_id=question_id, attachment_id=attachment_id),
+        range_header,
+    )
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/exams/{exam_id}/questions/{question_id}/attachments/{attachment_id}")
+def download_professor_exam_question_media(
+    professor_id: str,
+    course_code: str,
+    exam_id: int,
+    question_id: int,
+    attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return _stream_storage_download(
+        get_exam_question_attachment_download(db, course_id=course.id, exam_id=exam_id, question_id=question_id, attachment_id=attachment_id),
+        range_header,
+    )
+
+
+@app.post(
     "/api/students/{student_id}/courses/{course_code}/exams/{exam_id}/submit",
     response_model=StudentExamSubmitResultRead,
 )
@@ -1251,18 +1454,42 @@ def get_notice(
 @app.post("/api/professors/{professor_id}/notices", response_model=NoticeResponse, status_code=status.HTTP_201_CREATED)
 def add_notice(
     professor_id: str,
-    payload: NoticeCreate,
+    payload: NoticeCreate | None = None,
+    title: str | None = Form(None),
+    body: str | None = Form(None),
+    course_code: str | None = Form(None),
+    files: list[UploadFile] = File(default_factory=list),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> NoticeResponse | JSONResponse:
     try:
         require_professor_self(professor_id, current_user)
-        notice = create_notice(db, professor_id, payload.title, payload.body, payload.course_code)
+        notice_title = payload.title if payload is not None else (title or "")
+        notice_body = payload.body if payload is not None else (body or "")
+        notice_course_code = payload.course_code if payload is not None else course_code
+        notice = (
+            create_notice_with_attachments(db, professor_id, notice_title, notice_body, notice_course_code, files)
+            if files
+            else create_notice(db, professor_id, notice_title, notice_body, notice_course_code)
+        )
         notices = list_notices(db, professor_id)
         created = next(item for item in notices if item["id"] == notice.id)
         return NoticeResponse(data=NoticeRead(**created), message="created", meta={"professor_id": professor_id})
     except HTTPException as exc:
         return notice_error_response(exc)
+
+
+@app.get("/api/notices/{login_id}/{notice_id}/attachments/{attachment_id}")
+def download_notice_attachment(
+    login_id: str,
+    notice_id: int,
+    attachment_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    require_login_match(login_id, current_user)
+    return _stream_storage_download(get_notice_attachment_download(db, login_id, notice_id, attachment_id), range_header)
 
 
 @app.get("/api/admin/users", response_model=list[UserSummary])
@@ -1472,6 +1699,41 @@ async def professor_attendance_student_stats(
             ),
         )
     return build_professor_student_attendance_stats(db, professor_id, course_code)
+
+
+@app.post("/api/professors/{professor_id}/courses/{course_code}/attendance/report-exports", response_model=ReportExportRead, status_code=status.HTTP_201_CREATED)
+def create_professor_attendance_report_export(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ReportExportRead:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ReportExportRead(**create_attendance_csv_export(db, professor_id=professor_id, course_code=course_code))
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/report-exports", response_model=list[ReportExportRead])
+def list_professor_attendance_report_exports(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[ReportExportRead]:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return [ReportExportRead(**item) for item in list_attendance_csv_exports(db, professor_id=professor_id, course_code=course_code)]
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/report-exports/{export_id}/download")
+def download_professor_attendance_report_export(
+    professor_id: str,
+    course_code: str,
+    export_id: int,
+    range_header: str | None = Header(default=None, alias="Range"),
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return _stream_storage_download(get_report_export_download(db, professor_id=professor_id, course_code=course_code, export_id=export_id), range_header)
 
 
 @app.post("/api/professors/{professor_id}/courses/{course_code}/attendance/sessions/batch")

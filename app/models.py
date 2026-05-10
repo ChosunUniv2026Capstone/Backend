@@ -136,7 +136,10 @@ class AssignmentSubmissionAttachment(Base):
     stored_filename: Mapped[str] = mapped_column(String(255))
     mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
     file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
     storage_key: Mapped[str] = mapped_column(String(500))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -249,6 +252,96 @@ class ExamSubmissionAnswer(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class LearningItem(Base):
+    __tablename__ = "learning_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    item_type: Mapped[str] = mapped_column(String(20), default="file")
+    external_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_published: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class LearningItemAttachment(Base):
+    __tablename__ = "learning_item_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    learning_item_id: Mapped[int] = mapped_column(ForeignKey("learning_items.id"), index=True)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_filename: Mapped[str] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
+    storage_key: Mapped[str] = mapped_column(String(700))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NoticeAttachment(Base):
+    __tablename__ = "notice_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notice_id: Mapped[int] = mapped_column(ForeignKey("notices.id"), index=True)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_filename: Mapped[str] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
+    storage_key: Mapped[str] = mapped_column(String(700))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExamQuestionAttachment(Base):
+    __tablename__ = "exam_question_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("exam_questions.id"), index=True)
+    attachment_role: Mapped[str] = mapped_column(String(20), default="prompt")
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_filename: Mapped[str] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
+    storage_key: Mapped[str] = mapped_column(String(700))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReportExport(Base):
+    __tablename__ = "report_exports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("courses.id"), index=True, nullable=True)
+    requested_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    report_domain: Mapped[str] = mapped_column(String(20), default="attendance")
+    export_format: Mapped[str] = mapped_column(String(20), default="csv")
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_filename: Mapped[str] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_provider: Mapped[str] = mapped_column(String(20), default="local")
+    bucket_name: Mapped[str] = mapped_column(String(120), default="local")
+    storage_key: Mapped[str] = mapped_column(String(700))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AttendanceSession(Base):

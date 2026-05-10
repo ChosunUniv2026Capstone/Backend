@@ -8,6 +8,15 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://smartclass:smartclass@postgres:5432/smartclass"
     presence_service_url: str = "http://presence-service:8001"
     assignment_upload_dir: str = "storage/assignments"
+    object_storage_provider: str = "local"
+    object_storage_local_dir: str = "storage/objects"
+    object_storage_endpoint: str | None = None
+    object_storage_bucket: str = "smart-class"
+    object_storage_region: str = "us-east-1"
+    object_storage_access_key: str | None = None
+    object_storage_secret_key: str | None = None
+    object_storage_force_path_style: bool = True
+    object_storage_proxy_chunk_size_bytes: int = 1024 * 1024
     assignment_upload_max_files: int = 5
     assignment_upload_max_file_size_bytes: int = 10 * 1024 * 1024
     cors_origins: str = "*"
