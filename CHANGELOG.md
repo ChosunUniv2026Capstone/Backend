@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.2.0...v0.3.0) (2026-05-10)
+
+
+### Features
+
+* **backend:** implement assignment workflow api ([c2eb732](https://github.com/ChosunUniv2026Capstone/Backend/commit/c2eb732b3135f76fb4c61a0bcf5f46194a66e741))
+
 ## [0.2.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.1.0...v0.2.0) (2026-04-26)
 
 
