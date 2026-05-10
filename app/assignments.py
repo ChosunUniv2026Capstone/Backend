@@ -13,6 +13,8 @@ from app.models import Assignment, AssignmentSubmission, AssignmentSubmissionAtt
 
 settings = get_settings()
 FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+MAX_ASSIGNMENT_TITLE_LENGTH = 200
+MAX_ORIGINAL_FILENAME_LENGTH = 255
 
 
 def _assignment_status(assignment: Assignment, now: datetime | None = None) -> str:
@@ -58,16 +60,26 @@ def _load_assignment(db: Session, *, course_id: int, assignment_id: int) -> Assi
     return assignment
 
 
+def _invalid_payload_error(message: str, *, field: str, **details: object) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "ASSIGNMENT_INVALID_PAYLOAD",
+            "message": message,
+            "details": {"field": field, **details},
+        },
+    )
+
+
 def _normalize_title(value: str) -> str:
     title = value.strip()
     if not title:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "ASSIGNMENT_INVALID_PAYLOAD",
-                "message": "assignment title is required",
-                "details": {"field": "title"},
-            },
+        raise _invalid_payload_error("assignment title is required", field="title")
+    if len(title) > MAX_ASSIGNMENT_TITLE_LENGTH:
+        raise _invalid_payload_error(
+            "assignment title must be 200 characters or fewer",
+            field="title",
+            max_length=MAX_ASSIGNMENT_TITLE_LENGTH,
         )
     return title
 
@@ -84,10 +96,15 @@ def _validate_assignment_window(opens_at: datetime, due_at: datetime) -> None:
         )
 
 
-def _sanitize_filename(filename: str | None) -> str:
-    candidate = (filename or "attachment").strip()
+def _normalize_original_filename(filename: str | None) -> str:
+    candidate = (filename or "attachment").replace("\x00", "").strip()
     if not candidate:
         candidate = "attachment"
+    return candidate.replace("/", "_").replace("\\", "_")[:MAX_ORIGINAL_FILENAME_LENGTH] or "attachment"
+
+
+def _sanitize_filename(filename: str | None) -> str:
+    candidate = _normalize_original_filename(filename)
     sanitized = FILENAME_SANITIZE_PATTERN.sub("_", candidate)
     return sanitized[:180] or "attachment"
 
@@ -348,7 +365,8 @@ def _store_upload_file(
     assignment_id: int,
     student_user_id: int,
 ) -> dict:
-    sanitized_name = _sanitize_filename(upload.filename)
+    original_filename = _normalize_original_filename(upload.filename)
+    sanitized_name = _sanitize_filename(original_filename)
     stored_filename = f"{uuid4().hex}_{sanitized_name}"
     storage_key = os.path.join(
         f"assignment-{assignment_id}",
@@ -383,7 +401,7 @@ def _store_upload_file(
 
     upload.file.close()
     return {
-        "original_filename": upload.filename or sanitized_name,
+        "original_filename": original_filename,
         "stored_filename": stored_filename,
         "mime_type": upload.content_type or "application/octet-stream",
         "file_size_bytes": file_size,
