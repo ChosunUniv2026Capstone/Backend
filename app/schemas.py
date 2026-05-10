@@ -62,6 +62,72 @@ class NoticeResponse(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProfessorAssignmentCreateRequest(BaseModel):
+    title: str
+    description: str | None = None
+    opens_at: datetime
+    due_at: datetime
+
+
+class AssignmentAttachmentRead(BaseModel):
+    id: int
+    original_filename: str
+    mime_type: str | None = None
+    file_size_bytes: int
+    uploaded_at: datetime | None = None
+
+
+class StudentAssignmentSubmissionRead(BaseModel):
+    id: int
+    submission_text: str | None = None
+    submitted_at: datetime | None = None
+    updated_at: datetime | None = None
+    attachments: list[AssignmentAttachmentRead] = Field(default_factory=list)
+
+
+class StudentAssignmentSummaryRead(BaseModel):
+    id: int
+    title: str
+    description: str | None = None
+    opens_at: datetime
+    due_at: datetime
+    status: Literal["upcoming", "open", "closed"]
+    created_at: datetime | None = None
+    submitted: bool = False
+    submitted_at: datetime | None = None
+    attachment_count: int = 0
+
+
+class StudentAssignmentDetailRead(StudentAssignmentSummaryRead):
+    submission: StudentAssignmentSubmissionRead | None = None
+
+
+class ProfessorAssignmentSubmissionRead(BaseModel):
+    id: int
+    student_id: str
+    student_name: str
+    submission_text: str | None = None
+    submitted_at: datetime | None = None
+    updated_at: datetime | None = None
+    attachments: list[AssignmentAttachmentRead] = Field(default_factory=list)
+
+
+class ProfessorAssignmentSummaryRead(BaseModel):
+    id: int
+    title: str
+    description: str | None = None
+    opens_at: datetime
+    due_at: datetime
+    status: Literal["upcoming", "open", "closed"]
+    created_at: datetime | None = None
+    submission_count: int = 0
+    total_students: int = 0
+
+
+class ProfessorAssignmentDetailRead(ProfessorAssignmentSummaryRead):
+    submissions: list[ProfessorAssignmentSubmissionRead] = Field(default_factory=list)
+
+
 class ExamSummaryRead(BaseModel):
     id: int
     title: str
