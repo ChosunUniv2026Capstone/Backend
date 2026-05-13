@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -11,8 +12,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import issue_access_token
 from app.db import get_db
 from app.main import app
+from app.presence_client import PresenceClient
 import app.services as services_module
-from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, RegisteredDevice, User
+from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
 
 from datetime import datetime, timedelta
 
@@ -159,6 +161,70 @@ def seed_backend_state(session: Session) -> None:
     )
     session.add_all([network, device, enrollment, schedule])
 
+
+
+
+def test_student_can_re_register_deleted_device() -> None:
+    client, _ = make_client()
+    devices = client.get("/api/students/20201239/devices", headers=auth_header("20201239"))
+    assert devices.status_code == 200
+    device_id = devices.json()[0]["id"]
+
+    deleted = client.delete(f"/api/students/20201239/devices/{device_id}", headers=auth_header("20201239"))
+    assert deleted.status_code == 204
+
+    recreated = client.post(
+        "/api/students/20201239/devices",
+        headers=auth_header("20201239"),
+        json={"label": "Recovered Phone", "mac_address": "52:54:00:12:34:56"},
+    )
+
+    assert recreated.status_code == 201
+    assert recreated.json()["id"] == device_id
+    assert recreated.json()["label"] == "Recovered Phone"
+    assert recreated.json()["status"] == "active"
+
+
+def test_student_notice_list_includes_common_notices() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        professor = db.scalar(select(User).where(User.professor_id == "PRF002"))
+        db.add(Notice(author_user_id=professor.id, course_id=None, title="Common Notice", body="Everyone reads this"))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/notices/20201239", headers=auth_header("20201239"))
+
+    assert response.status_code == 200
+    common = next(item for item in response.json()["data"] if item["title"] == "Common Notice")
+    assert common["course_code"] is None
+
+
+def test_presence_client_maps_upstream_validation_error_to_http_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(*args, **kwargs):
+        request = httpx.Request("POST", "http://presence/admin/dummy/classrooms/B101/overlay")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"detail": {"code": "INVALID_AP_ID", "message": "invalid ap id", "details": {"apId": "demo-ap"}}},
+        )
+        return response
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(Exception) as exc_info:
+        PresenceClient("http://presence").apply_admin_overlay(classroom_code="B101", payload={"stations": []})
+
+    exc = exc_info.value
+    assert getattr(exc, "status_code", None) == 400
+    assert exc.detail["code"] == "INVALID_AP_ID"
+    assert exc.detail["details"] == {"apId": "demo-ap"}
 
 def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     client, _ = make_client()

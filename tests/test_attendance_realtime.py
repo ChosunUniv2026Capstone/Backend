@@ -540,7 +540,7 @@ def test_professor_student_stats_return_course_semester_totals() -> None:
     update = client.patch(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
         headers=auth_header("PRF002"),
-        json={"status": "present", "reason": ""},
+        json={"status": "present", "reason": "출석 확인"},
     )
     assert update.status_code == 200
 
@@ -611,7 +611,7 @@ def test_student_check_in_is_idempotent_and_updates_report() -> None:
 
 
 
-def test_professor_manual_update_allows_empty_reason() -> None:
+def test_professor_manual_update_rejects_empty_reason() -> None:
     client, _, _ = make_client()
     session_id, _ = _open_session(client, mode="manual")
     response = client.patch(
@@ -619,9 +619,8 @@ def test_professor_manual_update_allows_empty_reason() -> None:
         headers=auth_header("PRF002"),
         json={"status": "late", "reason": ""},
     )
-    assert response.status_code == 200
-    assert response.json()["new_status"] == "late"
-    assert response.json()["reason"] == ""
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "ATTENDANCE_REASON_REQUIRED"
 
 
 

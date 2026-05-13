@@ -1267,6 +1267,12 @@ def update_attendance_session_record(
     if new_status not in FINAL_STATUSES:
         raise attendance_api_error(400, "INVALID_ATTENDANCE_STATUS", "invalid attendance status", {"status": new_status})
     normalized_reason = (reason or "").strip()
+    if not normalized_reason:
+        raise attendance_api_error(
+            400,
+            "ATTENDANCE_REASON_REQUIRED",
+            "attendance status changes require a non-empty reason",
+        )
 
     professor = get_professor_user(db, professor_id)
     student = get_student_user(db, student_id)

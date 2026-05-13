@@ -169,6 +169,12 @@ def create_device(db: Session, student_id: str, payload: DeviceCreate) -> Regist
     mac_address = normalize_mac(payload.mac_address)
     existing = db.scalar(select(RegisteredDevice).where(RegisteredDevice.mac_address == mac_address))
     if existing:
+        if existing.user_id == user.id and existing.status == "deleted":
+            existing.label = payload.label.strip()
+            existing.status = "active"
+            db.commit()
+            db.refresh(existing)
+            return existing
         raise HTTPException(status_code=409, detail="MAC address already registered")
 
     device = RegisteredDevice(user_id=user.id, label=payload.label.strip(), mac_address=mac_address)
@@ -875,7 +881,7 @@ def create_professor_exam(
         starts_at=payload["starts_at"],
         ends_at=payload["ends_at"],
         duration_minutes=payload["duration_minutes"],
-        requires_presence=True,
+        requires_presence=bool(payload.get("requires_presence", True)),
         late_entry_allowed=payload["late_entry_allowed"],
         auto_submit_enabled=payload["auto_submit_enabled"],
         shuffle_questions=payload["shuffle_questions"],
@@ -924,7 +930,7 @@ def update_professor_exam(
     exam.starts_at = payload["starts_at"]
     exam.ends_at = payload["ends_at"]
     exam.duration_minutes = payload["duration_minutes"]
-    exam.requires_presence = True
+    exam.requires_presence = bool(payload.get("requires_presence", True))
     exam.late_entry_allowed = payload["late_entry_allowed"]
     exam.auto_submit_enabled = payload["auto_submit_enabled"]
     exam.shuffle_questions = payload["shuffle_questions"]
@@ -1320,27 +1326,28 @@ def start_student_exam(
             },
         )
 
-    eligibility = check_attendance_eligibility(
-        db=db,
-        presence_client=presence_client,
-        student_id=student_id,
-        course_id=course_code,
-        classroom_id=None,
-        purpose="exam",
-    )
-    if not eligibility["eligible"]:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PRESENCE_INELIGIBLE",
-                "message": "presence eligibility is required for this exam",
-                "details": {
-                    "exam_id": exam.id,
-                    "reason_code": eligibility["reason_code"],
-                    "evidence": eligibility.get("evidence", {}),
-                },
-            },
+    if exam.requires_presence:
+        eligibility = check_attendance_eligibility(
+            db=db,
+            presence_client=presence_client,
+            student_id=student_id,
+            course_id=course_code,
+            classroom_id=None,
+            purpose="exam",
         )
+        if not eligibility["eligible"]:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PRESENCE_INELIGIBLE",
+                    "message": "presence eligibility is required for this exam",
+                    "details": {
+                        "exam_id": exam.id,
+                        "reason_code": eligibility["reason_code"],
+                        "evidence": eligibility.get("evidence", {}),
+                    },
+                },
+            )
 
     expires_at = min(now + timedelta(minutes=exam.duration_minutes), exam.ends_at)
     effective_seconds = max(0.0, (expires_at - now).total_seconds())
@@ -1489,6 +1496,16 @@ def save_student_exam_answer(
                 "details": {"submission_id": submission.id, "status": submission.status},
             },
         )
+    now = datetime.now(UTC)
+    if submission.expires_at is not None and now > submission.expires_at:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "EXAM_SUBMISSION_EXPIRED",
+                "message": "submission answer saves are closed after the exam time window expires",
+                "details": {"submission_id": submission.id, "expires_at": submission.expires_at.isoformat()},
+            },
+        )
 
     question = db.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id, ExamQuestion.exam_id == exam.id))
     if question is None:
@@ -1525,7 +1542,6 @@ def save_student_exam_answer(
             ExamSubmissionAnswer.question_id == question.id,
         )
     )
-    now = datetime.now(UTC)
     answer_text = (payload.get("answer_text") or "").strip() or None
     if answer is None:
         answer = ExamSubmissionAnswer(
@@ -1562,9 +1578,14 @@ def list_notices(db: Session, login_id: str) -> list[dict]:
         .order_by(Notice.created_at.desc())
     )
     if user.role == "student":
-        stmt = stmt.join(CourseEnrollment, CourseEnrollment.course_id == Notice.course_id).where(
-            CourseEnrollment.student_user_id == user.id,
-            CourseEnrollment.status == "active",
+        stmt = stmt.join(CourseEnrollment, CourseEnrollment.course_id == Notice.course_id, isouter=True).where(
+            or_(
+                Notice.course_id.is_(None),
+                and_(
+                    CourseEnrollment.student_user_id == user.id,
+                    CourseEnrollment.status == "active",
+                ),
+            )
         )
     elif user.role == "professor":
         stmt = stmt.where(Notice.author_user_id == user.id)
