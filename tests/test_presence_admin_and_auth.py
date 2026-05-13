@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
@@ -10,9 +12,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import issue_access_token
 from app.db import get_db
 from app.main import app
-from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, RegisteredDevice, User
+from app.presence_client import PresenceClient
+import app.services as services_module
+from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 
 class FakePresenceClient:
@@ -158,6 +162,70 @@ def seed_backend_state(session: Session) -> None:
     session.add_all([network, device, enrollment, schedule])
 
 
+
+
+def test_student_can_re_register_deleted_device() -> None:
+    client, _ = make_client()
+    devices = client.get("/api/students/20201239/devices", headers=auth_header("20201239"))
+    assert devices.status_code == 200
+    device_id = devices.json()[0]["id"]
+
+    deleted = client.delete(f"/api/students/20201239/devices/{device_id}", headers=auth_header("20201239"))
+    assert deleted.status_code == 204
+
+    recreated = client.post(
+        "/api/students/20201239/devices",
+        headers=auth_header("20201239"),
+        json={"label": "Recovered Phone", "mac_address": "52:54:00:12:34:56"},
+    )
+
+    assert recreated.status_code == 201
+    assert recreated.json()["id"] == device_id
+    assert recreated.json()["label"] == "Recovered Phone"
+    assert recreated.json()["status"] == "active"
+
+
+def test_student_notice_list_includes_common_notices() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        professor = db.scalar(select(User).where(User.professor_id == "PRF002"))
+        db.add(Notice(author_user_id=professor.id, course_id=None, title="Common Notice", body="Everyone reads this"))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/notices/20201239", headers=auth_header("20201239"))
+
+    assert response.status_code == 200
+    common = next(item for item in response.json()["data"] if item["title"] == "Common Notice")
+    assert common["course_code"] is None
+
+
+def test_presence_client_maps_upstream_validation_error_to_http_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(*args, **kwargs):
+        request = httpx.Request("POST", "http://presence/admin/dummy/classrooms/B101/overlay")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"detail": {"code": "INVALID_AP_ID", "message": "invalid ap id", "details": {"apId": "demo-ap"}}},
+        )
+        return response
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(Exception) as exc_info:
+        PresenceClient("http://presence").apply_admin_overlay(classroom_code="B101", payload={"stations": []})
+
+    exc = exc_info.value
+    assert getattr(exc, "status_code", None) == 400
+    assert exc.detail["code"] == "INVALID_AP_ID"
+    assert exc.detail["details"] == {"apId": "demo-ap"}
+
 def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     client, _ = make_client()
     response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
@@ -189,6 +257,78 @@ def test_generic_attendance_eligibility_returns_outside_window_when_no_active_sc
     )
     assert response.status_code == 200
     assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
+
+
+def test_generic_attendance_eligibility_handles_overnight_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixed_now = datetime(2026, 5, 14, 0, 5, 0)
+
+    class _FixedDateTime:
+        @staticmethod
+        def now() -> datetime:
+            return fixed_now
+
+    client, fake_presence_client = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
+        schedule.day_of_week = (fixed_now.weekday() - 1) % 7
+        schedule.starts_at = (fixed_now - timedelta(minutes=35)).time().replace(microsecond=0)
+        schedule.ends_at = (fixed_now + timedelta(minutes=25)).time().replace(microsecond=0)
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(services_module, "datetime", _FixedDateTime)
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["eligible"] is True
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
+
+
+def test_generic_attendance_eligibility_ignores_future_same_day_overnight_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 5, 14, 0, 5, 0)
+
+    class _FixedDateTime:
+        @staticmethod
+        def now() -> datetime:
+            return fixed_now
+
+    client, fake_presence_client = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
+        schedule.day_of_week = fixed_now.weekday()
+        schedule.starts_at = time(23, 30)
+        schedule.ends_at = time(1, 0)
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(services_module, "datetime", _FixedDateTime)
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
+    assert fake_presence_client.last_eligibility_payload is None
 
 
 def test_resolve_active_classroom_conflict_returns_not_eligible() -> None:

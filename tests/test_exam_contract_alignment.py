@@ -9,14 +9,16 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 import app.services as services_module
-from app.models import Base, Course, CourseEnrollment, Exam, RegisteredDevice, User
+from app.models import Base, Course, CourseEnrollment, Exam, ExamQuestion, ExamQuestionOption, ExamSubmission, RegisteredDevice, User
 from app.schemas import ProfessorExamCreateRequest
 from app.services import (
     get_student_exam_detail,
     list_student_exams,
+    create_professor_exam,
     save_student_exam_answer,
     start_student_exam,
     submit_student_exam,
+    update_professor_exam,
 )
 
 
@@ -107,6 +109,40 @@ def seed_exam_context(session: Session) -> dict[str, int]:
         "closed_exam_id": closed_exam.id,
     }
 
+
+
+
+def professor_exam_payload(**overrides) -> dict:
+    now = datetime.now(UTC)
+    payload = {
+        "title": "Presence Optional Quiz",
+        "description": None,
+        "exam_type": "quiz",
+        "starts_at": now + timedelta(minutes=5),
+        "ends_at": now + timedelta(hours=1),
+        "duration_minutes": 30,
+        "requires_presence": False,
+        "late_entry_allowed": True,
+        "auto_submit_enabled": True,
+        "shuffle_questions": False,
+        "shuffle_options": False,
+        "max_attempts": 1,
+        "questions": [
+            {
+                "question_type": "multiple_choice",
+                "prompt": "Pick one",
+                "points": 1,
+                "explanation": None,
+                "is_required": True,
+                "options": [
+                    {"option_text": "A", "is_correct": True},
+                    {"option_text": "B", "is_correct": False},
+                ],
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
 
 def test_student_list_excludes_archived_exams(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = seed_exam_context(db_session)
@@ -204,3 +240,98 @@ def test_exam_model_defaults_requires_presence_true(db_session: Session) -> None
     db_session.flush()
 
     assert exam.requires_presence is True
+
+
+def test_professor_exam_create_and_update_preserve_requires_presence_false(db_session: Session) -> None:
+    ctx = seed_exam_context(db_session)
+    created = create_professor_exam(db=db_session, course_id=ctx["course_id"], payload=professor_exam_payload())
+
+    assert created["requires_presence"] is False
+
+    updated = update_professor_exam(
+        db=db_session,
+        course_id=ctx["course_id"],
+        exam_id=created["id"],
+        payload=professor_exam_payload(title="Still Optional"),
+    )
+
+    assert updated["requires_presence"] is False
+
+
+def test_non_presence_exam_start_skips_presence_client(db_session: Session) -> None:
+    ctx = seed_exam_context(db_session)
+    now = datetime.now(UTC)
+    exam = Exam(
+        course_id=ctx["course_id"],
+        title="No Presence Exam",
+        exam_type="quiz",
+        status="published",
+        starts_at=now - timedelta(minutes=5),
+        ends_at=now + timedelta(hours=1),
+        duration_minutes=30,
+        requires_presence=False,
+    )
+    db_session.add(exam)
+    db_session.commit()
+
+    class FailingPresenceClient:
+        def check_eligibility(self, **_kwargs):
+            raise AssertionError("presence client should not be called")
+
+    started = start_student_exam(
+        db=db_session,
+        presence_client=FailingPresenceClient(),
+        student_id="20201239",
+        student_user_id=ctx["student_user_id"],
+        course_code="CSE116",
+        course_id=ctx["course_id"],
+        exam_id=exam.id,
+    )
+
+    assert started["status"] == "in_progress"
+
+
+def test_save_student_exam_answer_rejects_expired_submission(db_session: Session) -> None:
+    ctx = seed_exam_context(db_session)
+    now = datetime.now(UTC)
+    exam = Exam(
+        course_id=ctx["course_id"],
+        title="Expired Answer Save",
+        exam_type="quiz",
+        status="published",
+        starts_at=now - timedelta(hours=1),
+        ends_at=now + timedelta(hours=1),
+        duration_minutes=30,
+    )
+    db_session.add(exam)
+    db_session.flush()
+    question = ExamQuestion(exam_id=exam.id, question_order=1, question_type="multiple_choice", prompt="Pick one", points=1)
+    db_session.add(question)
+    db_session.flush()
+    option = ExamQuestionOption(question_id=question.id, option_order=1, option_text="A", is_correct=True)
+    db_session.add(option)
+    submission = ExamSubmission(
+        exam_id=exam.id,
+        student_user_id=ctx["student_user_id"],
+        attempt_no=1,
+        status="in_progress",
+        started_at=now - timedelta(hours=1),
+        expires_at=now - timedelta(minutes=1),
+        time_limit_snapshot_minutes=30,
+    )
+    db_session.add(submission)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        save_student_exam_answer(
+            db=db_session,
+            student_user_id=ctx["student_user_id"],
+            course_id=ctx["course_id"],
+            exam_id=exam.id,
+            submission_id=submission.id,
+            question_id=question.id,
+            payload={"selected_option_id": option.id},
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "EXAM_SUBMISSION_EXPIRED"
