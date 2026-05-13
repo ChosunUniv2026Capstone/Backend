@@ -2016,7 +2016,7 @@ def _active_schedule_window_filter(weekday: int, current_time):
     overnight_same_day = and_(
         CourseSchedule.day_of_week == weekday,
         CourseSchedule.starts_at > CourseSchedule.ends_at,
-        or_(CourseSchedule.starts_at <= current_time, CourseSchedule.ends_at >= current_time),
+        CourseSchedule.starts_at <= current_time,
     )
     overnight_previous_day = and_(
         CourseSchedule.day_of_week == previous_weekday,
