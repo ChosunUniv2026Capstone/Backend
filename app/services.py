@@ -6,7 +6,7 @@ import re
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -1984,6 +1984,27 @@ def list_classroom_networks_for_classroom(db: Session, classroom_code: str) -> l
     ]
 
 
+def _active_schedule_window_filter(weekday: int, current_time):
+    previous_weekday = (weekday - 1) % 7
+    regular_same_day = and_(
+        CourseSchedule.day_of_week == weekday,
+        CourseSchedule.starts_at <= CourseSchedule.ends_at,
+        CourseSchedule.starts_at <= current_time,
+        CourseSchedule.ends_at >= current_time,
+    )
+    overnight_same_day = and_(
+        CourseSchedule.day_of_week == weekday,
+        CourseSchedule.starts_at > CourseSchedule.ends_at,
+        or_(CourseSchedule.starts_at <= current_time, CourseSchedule.ends_at >= current_time),
+    )
+    overnight_previous_day = and_(
+        CourseSchedule.day_of_week == previous_weekday,
+        CourseSchedule.starts_at > CourseSchedule.ends_at,
+        CourseSchedule.ends_at >= current_time,
+    )
+    return or_(regular_same_day, overnight_same_day, overnight_previous_day)
+
+
 def resolve_active_classroom_for_course(db: Session, course_id: str) -> str:
     now = datetime.now()
     weekday = now.weekday()
@@ -1995,9 +2016,7 @@ def resolve_active_classroom_for_course(db: Session, course_id: str) -> str:
         .join(Classroom, Classroom.id == CourseSchedule.classroom_id)
         .where(
             Course.course_code == course_id,
-            CourseSchedule.day_of_week == weekday,
-            CourseSchedule.starts_at <= current_time,
-            CourseSchedule.ends_at >= current_time,
+            _active_schedule_window_filter(weekday, current_time),
         )
     )
     classroom_codes = {row[0] for row in rows}
@@ -2041,9 +2060,7 @@ def list_presence_device_options(db: Session, classroom_code: str) -> list[dict]
             User.role == "student",
             CourseEnrollment.status == "active",
             Classroom.classroom_code == classroom_code,
-            CourseSchedule.day_of_week == weekday,
-            CourseSchedule.starts_at <= current_time,
-            CourseSchedule.ends_at >= current_time,
+            _active_schedule_window_filter(weekday, current_time),
         )
     )
 

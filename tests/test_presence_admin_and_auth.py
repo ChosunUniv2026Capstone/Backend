@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import issue_access_token
 from app.db import get_db
 from app.main import app
+import app.services as services_module
 from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, RegisteredDevice, User
 
 from datetime import datetime, timedelta
@@ -189,6 +191,41 @@ def test_generic_attendance_eligibility_returns_outside_window_when_no_active_sc
     )
     assert response.status_code == 200
     assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
+
+
+def test_generic_attendance_eligibility_handles_overnight_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixed_now = datetime(2026, 5, 14, 0, 5, 0)
+
+    class _FixedDateTime:
+        @staticmethod
+        def now() -> datetime:
+            return fixed_now
+
+    client, fake_presence_client = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
+        schedule.day_of_week = fixed_now.weekday()
+        schedule.starts_at = (fixed_now - timedelta(minutes=35)).time().replace(microsecond=0)
+        schedule.ends_at = (fixed_now + timedelta(minutes=25)).time().replace(microsecond=0)
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(services_module, "datetime", _FixedDateTime)
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["eligible"] is True
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
 def test_resolve_active_classroom_conflict_returns_not_eligible() -> None:
