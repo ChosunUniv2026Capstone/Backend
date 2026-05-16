@@ -18,6 +18,7 @@ from app.assignments import (
     get_professor_assignment_detail,
     get_student_assignment_attachment_download,
     get_student_assignment_detail,
+    grade_assignment_submission,
     list_professor_assignments,
     list_student_assignments,
     submit_student_assignment,
@@ -55,10 +56,22 @@ from app.attendance import (
 )
 from app.models import Course, CourseEnrollment, RegisteredDevice, User
 from app.presence_client import PresenceClient
+from app.lms_selected import (
+    answer_qna_thread,
+    build_professor_grades,
+    build_professor_learning_progress,
+    build_student_grades,
+    create_student_qna_thread,
+    list_professor_qna_threads,
+    list_student_learning_progress,
+    list_student_qna_threads,
+    update_student_learning_progress,
+)
 from app.schemas import (
     AdminClassroomNetworkThresholdUpdate,
     AdminPresenceSnapshotMutationRequest,
     AdminPresenceSnapshotRead,
+    AssignmentGradeRequest,
     AttendanceRecordUpdateRequest,
     AttendanceEligibilityRequest,
     AttendanceEligibilityResponse,
@@ -84,7 +97,10 @@ from app.schemas import (
     NoticeListResponse,
     NoticeResponse,
     LearningItemRead,
+    LearningProgressUpdateRequest,
     ProfessorExamCreateRequest,
+    QnaAnswerRequest,
+    QnaCreateRequest,
     StudentExamDetailRead,
     StudentExamSaveAnswerRead,
     StudentExamSaveAnswerRequest,
@@ -1103,6 +1119,27 @@ def get_professor_course_assignment_detail(
     )
 
 
+@app.put("/api/professors/{professor_id}/courses/{course_code}/assignments/{assignment_id}/submissions/{submission_id}/grade")
+def grade_professor_assignment_submission(
+    professor_id: str,
+    course_code: str,
+    assignment_id: int,
+    submission_id: int,
+    payload: AssignmentGradeRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> ProfessorAssignmentDetailRead:
+    professor, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return ProfessorAssignmentDetailRead(**grade_assignment_submission(
+        db,
+        course_id=course.id,
+        assignment_id=assignment_id,
+        submission_id=submission_id,
+        grader_user_id=professor.id,
+        payload=payload.model_dump(),
+    ))
+
+
 @app.get("/api/students/{student_id}/courses/{course_code}/assignments/{assignment_id}/attachments/{attachment_id}")
 def download_student_assignment_attachment(
     student_id: str,
@@ -1144,6 +1181,75 @@ def download_professor_assignment_attachment(
     return _stream_storage_download(download, range_header)
 
 
+@app.get("/api/students/{student_id}/courses/{course_code}/grades")
+def get_student_course_grades(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return build_student_grades(db, student=student, course=course)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/grades")
+def get_professor_course_grades(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return build_professor_grades(db, course=course)
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/qna")
+def get_student_course_qna(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return list_student_qna_threads(db, course=course, student=student)
+
+
+@app.post("/api/students/{student_id}/courses/{course_code}/qna", status_code=status.HTTP_201_CREATED)
+def post_student_course_qna(
+    student_id: str,
+    course_code: str,
+    payload: QnaCreateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return create_student_qna_thread(db, course=course, student=student, title=payload.title, body=payload.body)
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/qna")
+def get_professor_course_qna(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return list_professor_qna_threads(db, course=course)
+
+
+@app.post("/api/professors/{professor_id}/courses/{course_code}/qna/{thread_id}/answer", status_code=status.HTTP_201_CREATED)
+def post_professor_course_qna_answer(
+    professor_id: str,
+    course_code: str,
+    thread_id: int,
+    payload: QnaAnswerRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    professor, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return answer_qna_thread(db, course=course, professor=professor, thread_id=thread_id, body=payload.body, close=payload.close)
+
+
 @app.get("/api/students/{student_id}/courses/{course_code}/learning-items", response_model=list[LearningItemRead])
 def get_student_learning_items(
     student_id: str,
@@ -1164,6 +1270,48 @@ def get_professor_learning_items(
 ) -> list[LearningItemRead]:
     _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
     return [LearningItemRead(**item) for item in list_learning_items_for_course(db, course=course, include_unpublished=True)]
+
+
+@app.get("/api/students/{student_id}/courses/{course_code}/learning-progress")
+def get_student_course_learning_progress(
+    student_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return list_student_learning_progress(db, course=course, student=student)
+
+
+@app.put("/api/students/{student_id}/courses/{course_code}/learning-items/{learning_item_id}/progress")
+def put_student_course_learning_progress(
+    student_id: str,
+    course_code: str,
+    learning_item_id: int,
+    payload: LearningProgressUpdateRequest,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    student, course = require_student_course_access(student_id, course_code, current_user, db)
+    return update_student_learning_progress(
+        db,
+        course=course,
+        student=student,
+        learning_item_id=learning_item_id,
+        progress_percent=payload.progress_percent,
+        status=payload.status,
+    )
+
+
+@app.get("/api/professors/{professor_id}/courses/{course_code}/learning-progress")
+def get_professor_course_learning_progress(
+    professor_id: str,
+    course_code: str,
+    current_user: User = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    _, course = require_professor_course_ownership(professor_id, course_code, current_user, db)
+    return build_professor_learning_progress(db, course=course)
 
 
 @app.post("/api/professors/{professor_id}/courses/{course_code}/learning-items", response_model=LearningItemRead, status_code=status.HTTP_201_CREATED)

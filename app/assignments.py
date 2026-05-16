@@ -22,9 +22,15 @@ MAX_ORIGINAL_FILENAME_LENGTH = 255
 
 def _assignment_status(assignment: Assignment, now: datetime | None = None) -> str:
     current = now or datetime.now(UTC)
-    if current < assignment.opens_at:
+    opens_at = assignment.opens_at
+    due_at = assignment.due_at
+    if opens_at.tzinfo is None and current.tzinfo is not None:
+        current = current.replace(tzinfo=None)
+    elif opens_at.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    if current < opens_at:
         return "upcoming"
-    if current > assignment.due_at:
+    if current > due_at:
         return "closed"
     return "open"
 
@@ -162,6 +168,17 @@ def _serialize_attachment(attachment: AssignmentSubmissionAttachment) -> dict:
     }
 
 
+def _serialize_grade_fields(submission: AssignmentSubmission | None, assignment: Assignment | None = None) -> dict:
+    max_score = float(assignment.max_score) if assignment is not None and assignment.max_score is not None else 100.0
+    return {
+        "score": float(submission.score) if submission is not None and submission.score is not None else None,
+        "max_score": max_score,
+        "feedback": submission.feedback if submission is not None else None,
+        "grading_status": submission.grading_status if submission is not None else "submitted",
+        "graded_at": submission.graded_at if submission is not None else None,
+    }
+
+
 def _load_attachment_index(db: Session, submission_ids: list[int]) -> dict[int, list[AssignmentSubmissionAttachment]]:
     if not submission_ids:
         return {}
@@ -188,6 +205,7 @@ def _serialize_student_submission(
         "submission_text": submission.submission_text,
         "submitted_at": submission.submitted_at,
         "updated_at": submission.updated_at,
+        **_serialize_grade_fields(submission),
         "attachments": [_serialize_attachment(attachment) for attachment in attachments],
     }
 
@@ -203,10 +221,12 @@ def _serialize_student_assignment_summary(
         "description": assignment.description,
         "opens_at": assignment.opens_at,
         "due_at": assignment.due_at,
+        "max_score": float(assignment.max_score) if assignment.max_score is not None else 100.0,
         "status": _assignment_status(assignment),
         "created_at": assignment.created_at,
         "submitted": submission is not None,
         "submitted_at": submission.submitted_at if submission else None,
+        **_serialize_grade_fields(submission, assignment),
         "attachment_count": len(attachments),
     }
 
@@ -223,6 +243,7 @@ def _serialize_professor_assignment_summary(
         "description": assignment.description,
         "opens_at": assignment.opens_at,
         "due_at": assignment.due_at,
+        "max_score": float(assignment.max_score) if assignment.max_score is not None else 100.0,
         "status": _assignment_status(assignment),
         "created_at": assignment.created_at,
         "submission_count": submission_count,
@@ -364,6 +385,7 @@ def get_professor_assignment_detail(db: Session, *, course_id: int, assignment_i
             "submission_text": submission.submission_text,
             "submitted_at": submission.submitted_at,
             "updated_at": submission.updated_at,
+            **_serialize_grade_fields(submission, assignment),
             "attachments": [
                 _serialize_attachment(attachment)
                 for attachment in attachment_index.get(submission.id, [])
@@ -568,6 +590,69 @@ def submit_student_assignment(
         course_id=course_id,
         assignment_id=assignment.id,
     )
+
+
+def grade_assignment_submission(
+    db: Session,
+    *,
+    course_id: int,
+    assignment_id: int,
+    submission_id: int,
+    grader_user_id: int,
+    payload: dict,
+) -> dict:
+    assignment = _load_assignment(db, course_id=course_id, assignment_id=assignment_id)
+    submission = db.scalar(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.id == submission_id,
+            AssignmentSubmission.assignment_id == assignment.id,
+        )
+    )
+    if submission is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "ASSIGNMENT_SUBMISSION_NOT_FOUND",
+                "message": "assignment submission not found",
+                "details": {"submission_id": submission_id},
+            },
+        )
+
+    grading_status = payload.get("grading_status") or "graded"
+    if grading_status not in {"submitted", "graded", "returned"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "ASSIGNMENT_INVALID_GRADE", "message": "invalid grading status", "details": {"grading_status": grading_status}},
+        )
+
+    score = payload.get("score")
+    if score is not None:
+        try:
+            score = float(score)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "ASSIGNMENT_INVALID_GRADE", "message": "score must be numeric", "details": {}},
+            ) from exc
+        max_score = float(assignment.max_score) if assignment.max_score is not None else 100.0
+        if score < 0 or score > max_score:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "ASSIGNMENT_INVALID_GRADE",
+                    "message": "score is outside assignment max score",
+                    "details": {"score": score, "max_score": max_score},
+                },
+            )
+
+    submission.score = score
+    submission.feedback = (payload.get("feedback") or "").strip() or None
+    submission.grading_status = grading_status
+    submission.graded_by_user_id = grader_user_id
+    submission.graded_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(submission)
+    return get_professor_assignment_detail(db, course_id=course_id, assignment_id=assignment.id)
 
 
 def get_student_assignment_attachment_download(

@@ -112,6 +112,10 @@ class LearningItemRead(BaseModel):
 class StudentAssignmentSubmissionRead(BaseModel):
     id: int
     submission_text: str | None = None
+    score: float | None = None
+    feedback: str | None = None
+    graded_at: datetime | None = None
+    grading_status: str | None = None
     submitted_at: datetime | None = None
     updated_at: datetime | None = None
     attachments: list[AssignmentAttachmentRead] = Field(default_factory=list)
@@ -123,11 +127,15 @@ class StudentAssignmentSummaryRead(BaseModel):
     description: str | None = None
     opens_at: datetime
     due_at: datetime
+    max_score: float = 100
     status: Literal["upcoming", "open", "closed"]
     created_at: datetime | None = None
     submitted: bool = False
     submitted_at: datetime | None = None
     attachment_count: int = 0
+    score: float | None = None
+    feedback: str | None = None
+    grading_status: str | None = None
 
 
 class StudentAssignmentDetailRead(StudentAssignmentSummaryRead):
@@ -139,6 +147,10 @@ class ProfessorAssignmentSubmissionRead(BaseModel):
     student_id: str
     student_name: str
     submission_text: str | None = None
+    score: float | None = None
+    feedback: str | None = None
+    graded_at: datetime | None = None
+    grading_status: str | None = None
     submitted_at: datetime | None = None
     updated_at: datetime | None = None
     attachments: list[AssignmentAttachmentRead] = Field(default_factory=list)
@@ -150,6 +162,7 @@ class ProfessorAssignmentSummaryRead(BaseModel):
     description: str | None = None
     opens_at: datetime
     due_at: datetime
+    max_score: float = 100
     status: Literal["upcoming", "open", "closed"]
     created_at: datetime | None = None
     submission_count: int = 0
@@ -158,6 +171,27 @@ class ProfessorAssignmentSummaryRead(BaseModel):
 
 class ProfessorAssignmentDetailRead(ProfessorAssignmentSummaryRead):
     submissions: list[ProfessorAssignmentSubmissionRead] = Field(default_factory=list)
+
+
+class AssignmentGradeRequest(BaseModel):
+    score: float | None = None
+    feedback: str | None = None
+    grading_status: Literal["submitted", "graded", "returned"] = "graded"
+
+
+class QnaCreateRequest(BaseModel):
+    title: str
+    body: str
+
+
+class QnaAnswerRequest(BaseModel):
+    body: str
+    close: bool = False
+
+
+class LearningProgressUpdateRequest(BaseModel):
+    progress_percent: float = Field(ge=0, le=100)
+    status: Literal["not_started", "in_progress", "completed"] = "in_progress"
 
 
 class ExamSummaryRead(BaseModel):
