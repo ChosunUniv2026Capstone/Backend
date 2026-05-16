@@ -16,7 +16,7 @@ from app.presence_client import PresenceClient
 import app.services as services_module
 from app.models import AccessPoint, AccessPointInterface, Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
 
 class FakePresenceClient:
@@ -241,8 +241,8 @@ def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     assert option["deviceLabel"] == "Choi Phone"
 
 
-def test_generic_attendance_eligibility_returns_outside_window_when_no_active_schedule() -> None:
-    client, _ = make_client()
+def test_generic_attendance_eligibility_uses_course_classroom_outside_window() -> None:
+    client, fake_presence_client = make_client()
     from app.db import get_db as backend_get_db
     from app.main import app as backend_app
 
@@ -261,10 +261,14 @@ def test_generic_attendance_eligibility_returns_outside_window_when_no_active_sc
         json={"student_id": "20201239", "course_code": "CSE116"},
     )
     assert response.status_code == 200
-    assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
+    assert response.json()["eligible"] is True
+    assert response.json()["reason_code"] == "OK"
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
-def test_generic_attendance_eligibility_handles_overnight_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generic_attendance_eligibility_uses_mapping_for_overnight_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fixed_now = datetime(2026, 5, 14, 0, 5, 0)
 
     class _FixedDateTime:
@@ -299,7 +303,7 @@ def test_generic_attendance_eligibility_handles_overnight_schedule(monkeypatch: 
     assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
-def test_generic_attendance_eligibility_ignores_future_same_day_overnight_schedule(
+def test_generic_attendance_eligibility_uses_mapping_for_future_same_day_overnight_schedule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixed_now = datetime(2026, 5, 14, 0, 5, 0)
@@ -318,8 +322,8 @@ def test_generic_attendance_eligibility_ignores_future_same_day_overnight_schedu
     try:
         schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
         schedule.day_of_week = fixed_now.weekday()
-        schedule.starts_at = time(23, 30)
-        schedule.ends_at = time(1, 0)
+        schedule.starts_at = (fixed_now + timedelta(hours=23, minutes=25)).time().replace(microsecond=0)
+        schedule.ends_at = (fixed_now + timedelta(minutes=55)).time().replace(microsecond=0)
         db.commit()
     finally:
         db.close()
@@ -332,8 +336,9 @@ def test_generic_attendance_eligibility_ignores_future_same_day_overnight_schedu
     )
 
     assert response.status_code == 200
-    assert response.json()["reason_code"] == "OUTSIDE_CLASS_WINDOW"
-    assert fake_presence_client.last_eligibility_payload is None
+    assert response.json()["eligible"] is True
+    assert response.json()["reason_code"] == "OK"
+    assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
 def test_resolve_active_classroom_conflict_returns_not_eligible() -> None:

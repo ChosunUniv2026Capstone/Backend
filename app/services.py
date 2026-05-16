@@ -2186,6 +2186,36 @@ def resolve_active_classroom_for_course(db: Session, course_id: str) -> str:
     )
 
 
+def resolve_mapped_classroom_for_course(db: Session, course_id: str) -> str:
+    rows = db.execute(
+        select(Classroom.classroom_code)
+        .select_from(CourseSchedule)
+        .join(Course, Course.id == CourseSchedule.course_id)
+        .join(Classroom, Classroom.id == CourseSchedule.classroom_id)
+        .where(Course.course_code == course_id)
+    )
+    classroom_codes = {row[0] for row in rows}
+    if not classroom_codes:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CLASSROOM_NOT_MAPPED",
+                "message": "no classroom mapping exists for the current course",
+                "details": {"course_code": course_id},
+            },
+        )
+    if len(classroom_codes) == 1:
+        return classroom_codes.pop()
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "CLASSROOM_CONFLICT",
+            "message": "multiple classrooms were resolved for the current course",
+            "details": {"course_code": course_id, "classroom_codes": sorted(classroom_codes)},
+        },
+    )
+
+
 def list_presence_device_options(db: Session, classroom_code: str) -> list[dict]:
     now = datetime.now()
     weekday = now.weekday()
@@ -2286,11 +2316,15 @@ def check_attendance_eligibility(
         }
 
     try:
-        resolved_classroom_id = resolve_active_classroom_for_course(db, course_id)
+        # The generic student proximity check is not an attendance self check-in.
+        # It must use the selected course's classroom mapping even outside the
+        # current lecture time window; actual attendance submission remains
+        # gated by the attendance session flow.
+        resolved_classroom_id = resolve_mapped_classroom_for_course(db, course_id)
     except HTTPException as exc:
         return {
             "eligible": False,
-            "reason_code": exc.detail["code"] if isinstance(exc.detail, dict) else "OUTSIDE_CLASS_WINDOW",
+            "reason_code": exc.detail["code"] if isinstance(exc.detail, dict) else "CLASSROOM_NOT_MAPPED",
             "matched_device_mac": None,
             "observed_at": None,
             "snapshot_age_seconds": None,
