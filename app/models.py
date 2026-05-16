@@ -83,6 +83,39 @@ class ClassroomNetwork(Base):
     collection_mode: Mapped[str] = mapped_column(String(40))
 
 
+class AccessPoint(Base):
+    __tablename__ = "access_points"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collector_ap_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(120))
+    management_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tailnet_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
+    token_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AccessPointInterface(Base):
+    __tablename__ = "access_point_interfaces"
+    __table_args__ = (
+        UniqueConstraint("access_point_id", "interface_id"),
+        UniqueConstraint("classroom_network_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    access_point_id: Mapped[int] = mapped_column(ForeignKey("access_points.id"), index=True)
+    interface_id: Mapped[str] = mapped_column(String(64))
+    bssid: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ssid: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    classroom_network_id: Mapped[int] = mapped_column(ForeignKey("classroom_networks.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Notice(Base):
     __tablename__ = "notices"
 

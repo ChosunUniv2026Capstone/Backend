@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
+import hashlib
 import math
 import re
+import secrets
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
@@ -10,6 +12,8 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AccessPoint,
+    AccessPointInterface,
     Classroom,
     ClassroomNetwork,
     Course,
@@ -38,6 +42,126 @@ MAC_PATTERN = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 MAX_DEVICES_PER_STUDENT = 5
 FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 settings = get_settings()
+
+
+def _utcnow_service() -> datetime:
+    return datetime.now(UTC)
+
+
+def hash_ap_token(token: str) -> str:
+    return hashlib.sha256(f"{settings.ap_token_hash_secret}:{token}".encode("utf-8")).hexdigest()
+
+
+def _access_point_or_404(db: Session, collector_ap_id: str) -> AccessPoint:
+    access_point = db.scalar(select(AccessPoint).where(AccessPoint.collector_ap_id == collector_ap_id))
+    if access_point is None:
+        raise HTTPException(status_code=404, detail={"code": "ACCESS_POINT_NOT_FOUND", "message": "access point not found", "details": {"collector_ap_id": collector_ap_id}})
+    return access_point
+
+
+def list_access_points(db: Session) -> list[dict]:
+    rows = db.execute(
+        select(AccessPoint, AccessPointInterface, ClassroomNetwork, Classroom)
+        .outerjoin(AccessPointInterface, AccessPointInterface.access_point_id == AccessPoint.id)
+        .outerjoin(ClassroomNetwork, ClassroomNetwork.id == AccessPointInterface.classroom_network_id)
+        .outerjoin(Classroom, Classroom.id == ClassroomNetwork.classroom_id)
+        .order_by(AccessPoint.collector_ap_id.asc(), AccessPointInterface.interface_id.asc())
+    ).all()
+    by_id: dict[int, dict] = {}
+    for access_point, interface, network, classroom in rows:
+        entry = by_id.setdefault(
+            access_point.id,
+            {
+                "id": access_point.id,
+                "collector_ap_id": access_point.collector_ap_id,
+                "label": access_point.label,
+                "management_ip": access_point.management_ip,
+                "tailnet_ip": access_point.tailnet_ip,
+                "status": access_point.status,
+                "token_configured": bool(access_point.token_hash) and access_point.token_revoked_at is None,
+                "token_version": access_point.token_version,
+                "token_revoked_at": access_point.token_revoked_at,
+                "last_rotated_at": access_point.last_rotated_at,
+                "interfaces": [],
+            },
+        )
+        if interface is not None and network is not None and classroom is not None:
+            entry["interfaces"].append(
+                {
+                    "interface_id": interface.interface_id,
+                    "bssid": interface.bssid,
+                    "ssid": interface.ssid or network.ssid,
+                    "classroom_code": classroom.classroom_code,
+                    "classroom_network_id": network.id,
+                    "classroom_network_ap_id": network.ap_id,
+                    "signal_threshold_dbm": network.signal_threshold_dbm,
+                    "collection_mode": network.collection_mode,
+                }
+            )
+    return list(by_id.values())
+
+
+def issue_access_point_token(db: Session, collector_ap_id: str) -> dict:
+    access_point = _access_point_or_404(db, collector_ap_id)
+    token = secrets.token_urlsafe(32)
+    now = _utcnow_service()
+    access_point.token_hash = hash_ap_token(token)
+    access_point.token_version = (access_point.token_version or 0) + 1
+    access_point.token_revoked_at = None
+    access_point.last_rotated_at = now
+    access_point.updated_at = now
+    db.add(access_point)
+    db.commit()
+    db.refresh(access_point)
+    return {
+        "collector_ap_id": access_point.collector_ap_id,
+        "token": token,
+        "token_version": access_point.token_version,
+        "last_rotated_at": access_point.last_rotated_at,
+    }
+
+
+def revoke_access_point_token(db: Session, collector_ap_id: str) -> dict:
+    access_point = _access_point_or_404(db, collector_ap_id)
+    now = _utcnow_service()
+    access_point.token_revoked_at = now
+    access_point.updated_at = now
+    db.add(access_point)
+    db.commit()
+    return {"collector_ap_id": access_point.collector_ap_id, "token_revoked_at": access_point.token_revoked_at}
+
+
+def build_presence_registry(db: Session) -> dict:
+    access_points = []
+    for entry in list_access_points(db):
+        ap = _access_point_or_404(db, entry["collector_ap_id"])
+        access_points.append(
+            {
+                "collectorApId": ap.collector_ap_id,
+                "label": ap.label,
+                "managementIp": ap.management_ip,
+                "tailnetIp": ap.tailnet_ip,
+                "status": ap.status,
+                "tokenHash": ap.token_hash,
+                "tokenVersion": ap.token_version,
+                "tokenRevokedAt": ap.token_revoked_at.isoformat() if ap.token_revoked_at else None,
+                "lastRotatedAt": ap.last_rotated_at.isoformat() if ap.last_rotated_at else None,
+                "interfaces": [
+                    {
+                        "interfaceId": iface["interface_id"],
+                        "bssid": iface["bssid"],
+                        "ssid": iface["ssid"],
+                        "classroomId": iface["classroom_code"],
+                        "classroomNetworkId": iface["classroom_network_id"],
+                        "classroomNetworkApId": iface["classroom_network_ap_id"],
+                        "signalThresholdDbm": iface["signal_threshold_dbm"],
+                        "collectionMode": iface["collection_mode"],
+                    }
+                    for iface in entry["interfaces"]
+                ],
+            }
+        )
+    return {"accessPoints": access_points}
 
 
 @dataclass(frozen=True)

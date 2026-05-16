@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     refresh_cookie_path: str = "/api/auth"
     refresh_cookie_domain: str | None = None
     auth_allow_legacy_dev_tokens: bool = True
+    ap_token_hash_secret: str = "smart-class-dev-ap-token-pepper"
+    presence_internal_token: str = "smart-class-dev-internal-token"
     local_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost,http://127.0.0.1"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
