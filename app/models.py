@@ -1,6 +1,6 @@
 from datetime import datetime, time
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -113,6 +113,23 @@ class AccessPointInterface(Base):
     bssid: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ssid: Mapped[str | None] = mapped_column(String(120), nullable=True)
     classroom_network_id: Mapped[int] = mapped_column(ForeignKey("classroom_networks.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PresenceEligibilityLog(Base):
+    __tablename__ = "presence_eligibility_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("courses.id"), nullable=True)
+    classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)
+    purpose: Mapped[str] = mapped_column(String(20))
+    eligible: Mapped[bool] = mapped_column(Boolean)
+    reason_code: Mapped[str] = mapped_column(String(64))
+    matched_device_mac: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snapshot_age_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

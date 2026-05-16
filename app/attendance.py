@@ -19,6 +19,7 @@ from app.models import (
     Course,
     CourseEnrollment,
     CourseSchedule,
+    PresenceEligibilityLog,
     RegisteredDevice,
     User,
 )
@@ -1430,6 +1431,41 @@ def _registered_devices_payload(db: Session, student: User) -> list[dict[str, st
 
 
 
+def _parse_presence_observed_at(value: Any) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _persist_attendance_presence_log(
+    db: Session,
+    *,
+    student: User,
+    course: Course,
+    assignment: SessionSlotAssignment,
+    result: dict[str, Any],
+) -> None:
+    log = PresenceEligibilityLog(
+        student_user_id=student.id,
+        course_id=course.id,
+        classroom_id=assignment.classroom_id,
+        purpose="attendance",
+        eligible=bool(result.get("eligible")),
+        reason_code=result.get("reason_code", "UNKNOWN"),
+        matched_device_mac=result.get("matched_device_mac"),
+        evidence=result.get("evidence") or {},
+        observed_at=_parse_presence_observed_at(result.get("observed_at")),
+        snapshot_age_seconds=result.get("snapshot_age_seconds"),
+    )
+    db.add(log)
+    db.flush()
+
+
 def _presence_eligibility_for_assignment(
     db: Session,
     presence_client: PresenceClient,
@@ -1437,10 +1473,11 @@ def _presence_eligibility_for_assignment(
     course: Course,
     assignment: SessionSlotAssignment,
     registered_devices: list[dict[str, str]],
+    persist_log: bool = False,
 ) -> dict[str, Any]:
     classroom = db.scalar(select(Classroom).where(Classroom.id == assignment.classroom_id))
     if not registered_devices:
-        return {
+        result = {
             "eligible": False,
             "reason_code": "DEVICE_NOT_REGISTERED",
             "matched_device_mac": None,
@@ -1448,6 +1485,9 @@ def _presence_eligibility_for_assignment(
             "snapshot_age_seconds": None,
             "evidence": {},
         }
+        if persist_log:
+            _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=result)
+        return result
     payload = presence_client.check_eligibility(
         student_id=student.student_id or "",
         course_id=course.course_code,
@@ -1463,7 +1503,7 @@ def _presence_eligibility_for_assignment(
         ],
         registered_devices=registered_devices,
     )
-    return {
+    result = {
         "eligible": bool(payload.get("eligible")),
         "reason_code": payload.get("reasonCode", "UNKNOWN"),
         "matched_device_mac": payload.get("matchedDeviceMac"),
@@ -1471,6 +1511,9 @@ def _presence_eligibility_for_assignment(
         "snapshot_age_seconds": payload.get("snapshotAgeSeconds"),
         "evidence": payload.get("evidence", {}),
     }
+    if persist_log:
+        _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=result)
+    return result
 
 
 
@@ -1575,6 +1618,7 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
             course,
             assignment,
             registered_devices,
+            persist_log=True,
         )
         if not eligibility["eligible"]:
             rejected_count += 1
@@ -1655,6 +1699,8 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
         for audit in pending_audits:
             audit.version = version
             db.add(audit)
+        db.commit()
+    elif assignments:
         db.commit()
 
     changed_count = len(changed_projection_keys)
