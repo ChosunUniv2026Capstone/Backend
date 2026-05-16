@@ -24,10 +24,12 @@ class FakePresenceClient:
         self.last_overlay_payload = None
         self.last_eligibility_payload = None
         self.last_admin_refresh = None
+        self.last_admin_source = None
 
-    def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False):
+    def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False, source: str = "auto"):
         assert classroom_code == "B101"
         self.last_admin_refresh = refresh
+        self.last_admin_source = source
         return {
             "cacheHit": False,
             "overlayActive": True,
@@ -421,9 +423,10 @@ def test_admin_presence_snapshot_enriches_owner_data() -> None:
 
 def test_admin_presence_snapshot_forwards_refresh_flag() -> None:
     client, fake_presence = make_client()
-    response = client.get("/api/admin/presence/classrooms/B101/snapshot?refresh=true", headers=auth_header("ADM001"))
+    response = client.get("/api/admin/presence/classrooms/B101/snapshot?refresh=true&source=demo", headers=auth_header("ADM001"))
     assert response.status_code == 200
     assert fake_presence.last_admin_refresh is True
+    assert fake_presence.last_admin_source == "demo"
 
 
 def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
