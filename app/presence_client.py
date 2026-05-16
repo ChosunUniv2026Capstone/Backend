@@ -60,9 +60,10 @@ class PresenceClient:
             _raise_presence_http_error(exc)
         return response.json()
 
-    def get_admin_snapshot(self, *, classroom_code: str) -> dict[str, Any]:
+    def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False) -> dict[str, Any]:
         response = httpx.get(
             f"{self._base_url}/admin/dummy/classrooms/{classroom_code}/snapshot",
+            params={"refresh": "true"} if refresh else None,
             timeout=10.0,
         )
         try:

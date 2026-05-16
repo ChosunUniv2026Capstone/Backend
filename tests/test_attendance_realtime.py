@@ -50,7 +50,7 @@ class FakePresenceClient:
             "evidence": {"classroomId": classroom_id, "matchedApIds": [classroom_networks[0]["apId"]]},
         }
 
-    def get_admin_snapshot(self, *, classroom_code: str):
+    def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False):
         raise AssertionError("admin snapshot should not be used in attendance tests")
 
     def apply_admin_overlay(self, *, classroom_code: str, payload: dict):
