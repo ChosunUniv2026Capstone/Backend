@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.4.1...v0.5.0) (2026-05-16)
+
+
+### Features
+
+* **backend:** align API responses with envelope contract ([91d5c49](https://github.com/ChosunUniv2026Capstone/Backend/commit/91d5c491b9bac85fff2fd61e3a49aa1f10a33ca6))
+* **backend:** enable selected LMS demo APIs ([ec7a5f5](https://github.com/ChosunUniv2026Capstone/Backend/commit/ec7a5f503ddf39c767365a7ad0d3ee413a5c1425))
+* **backend:** forward admin snapshot source ([ad5e59d](https://github.com/ChosunUniv2026Capstone/Backend/commit/ad5e59d5961e648eac73f384aeddde53cdcf7af7))
+* **backend:** own AP token registry for collector push ([31d18f3](https://github.com/ChosunUniv2026Capstone/Backend/commit/31d18f3f566cded964c464a64f7770f8a800b00f))
+* **backend:** pass admin snapshot refresh through ([723af07](https://github.com/ChosunUniv2026Capstone/Backend/commit/723af07999709312367774eaf2ae8c64f43281de))
+
 ## [0.4.1](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.4.0...v0.4.1) (2026-05-14)
 
 
