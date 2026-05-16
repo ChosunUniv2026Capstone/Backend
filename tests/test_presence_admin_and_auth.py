@@ -14,7 +14,7 @@ from app.db import get_db
 from app.main import app
 from app.presence_client import PresenceClient
 import app.services as services_module
-from app.models import AccessPoint, AccessPointInterface, Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
+from app.models import AccessPoint, AccessPointInterface, Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, PresenceEligibilityLog, RegisteredDevice, User
 
 from datetime import datetime, timedelta
 
@@ -25,6 +25,8 @@ class FakePresenceClient:
         self.last_eligibility_payload = None
         self.last_admin_refresh = None
         self.last_admin_source = None
+        self.next_eligibility_response = None
+        self.reason_code = "OK"
 
     def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False, source: str = "auto"):
         assert classroom_code == "B101"
@@ -90,9 +92,11 @@ class FakePresenceClient:
         assert course_id == "CSE116"
         assert classroom_id == "B101"
         assert classroom_networks[0]["apId"] == "phy3-ap0"
+        if self.next_eligibility_response is not None:
+            return self.next_eligibility_response
         return {
-            "eligible": True,
-            "reasonCode": "OK",
+            "eligible": self.reason_code == "OK",
+            "reasonCode": self.reason_code,
             "matchedDeviceMac": registered_devices[0]["mac"],
             "observedAt": "2026-04-07T15:05:00+09:00",
             "snapshotAgeSeconds": 2,
@@ -243,6 +247,28 @@ def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     option = next(item for item in payload["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
     assert option["studentLoginId"] == "20201239"
     assert option["deviceLabel"] == "Choi Phone"
+
+
+def test_admin_presence_snapshot_dropdown_ignores_current_schedule_window() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        schedule = db.scalar(select(CourseSchedule).join(Course).where(Course.course_code == "CSE116"))
+        schedule.day_of_week = (datetime.now().weekday() + 3) % 7
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
+
+    assert response.status_code == 200
+    option = next(item for item in response.json()["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
+    assert option["studentLoginId"] == "20201239"
+    assert option["studentName"] == "Kim Student 06"
 
 
 def test_generic_attendance_eligibility_uses_course_classroom_outside_window() -> None:
@@ -743,3 +769,154 @@ def test_admin_can_revoke_ap_token() -> None:
     listed = client.get("/api/admin/access-points", headers=auth_header("ADM001"))
     assert listed.status_code == 200
     assert listed.json()["data"]["access_points"][0]["token_configured"] is False
+
+
+def test_attendance_eligibility_persists_success_log() -> None:
+    client, _ = make_client()
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+    assert response.status_code == 200
+
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        logs = db.scalars(select(PresenceEligibilityLog)).all()
+        assert len(logs) == 1
+        log = logs[0]
+        assert log.purpose == "attendance"
+        assert log.eligible is True
+        assert log.reason_code == "OK"
+        assert log.matched_device_mac == "52:54:00:12:34:56"
+        assert log.snapshot_age_seconds == 2
+        assert log.evidence["classroomId"] == "B101"
+    finally:
+        db.close()
+
+
+def test_attendance_eligibility_persists_device_denial_log() -> None:
+    client, _ = make_client()
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        device = db.scalar(select(RegisteredDevice).where(RegisteredDevice.mac_address == "52:54:00:12:34:56"))
+        db.delete(device)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "DEVICE_NOT_REGISTERED"
+
+    db = next(override())
+    try:
+        log = db.scalar(select(PresenceEligibilityLog))
+        assert log is not None
+        assert log.eligible is False
+        assert log.reason_code == "DEVICE_NOT_REGISTERED"
+        assert log.evidence == {}
+    finally:
+        db.close()
+
+
+def test_attendance_eligibility_persists_stale_snapshot_denial_log() -> None:
+    client, fake_presence_client = make_client()
+    fake_presence_client.reason_code = "SNAPSHOT_STALE"
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+    assert response.status_code == 200
+    assert response.json()["eligible"] is False
+    assert response.json()["reason_code"] == "SNAPSHOT_STALE"
+
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        log = db.scalar(select(PresenceEligibilityLog))
+        assert log is not None
+        assert log.eligible is False
+        assert log.reason_code == "SNAPSHOT_STALE"
+        assert log.matched_device_mac == "52:54:00:12:34:56"
+        assert log.snapshot_age_seconds == 2
+    finally:
+        db.close()
+
+
+def test_attendance_eligibility_persists_stale_snapshot_log() -> None:
+    client, fake_presence = make_client()
+    fake_presence.next_eligibility_response = {
+        "eligible": False,
+        "reasonCode": "STALE_SNAPSHOT",
+        "matchedDeviceMac": "52:54:00:12:34:56",
+        "observedAt": "2026-04-07T14:40:00+09:00",
+        "snapshotAgeSeconds": 1500,
+        "evidence": {"snapshotStale": True},
+    }
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason_code"] == "STALE_SNAPSHOT"
+
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        log = db.scalar(select(PresenceEligibilityLog).where(PresenceEligibilityLog.reason_code == "STALE_SNAPSHOT"))
+        assert log is not None
+        assert log.eligible is False
+        assert log.snapshot_age_seconds == 1500
+        assert log.evidence["snapshotStale"] is True
+    finally:
+        db.close()
+
+
+def test_exam_presence_eligibility_persists_log() -> None:
+    client, _ = make_client()
+    from app.services import check_attendance_eligibility
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app, presence_client
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        result = check_attendance_eligibility(
+            db=db,
+            presence_client=presence_client,
+            student_id="20201239",
+            course_id="CSE116",
+            classroom_id=None,
+            purpose="exam",
+        )
+        assert result["eligible"] is True
+        log = db.scalar(select(PresenceEligibilityLog).where(PresenceEligibilityLog.purpose == "exam"))
+        assert log is not None
+        assert log.reason_code == "OK"
+        assert log.evidence["mode"] == "registered-device-only"
+    finally:
+        db.close()

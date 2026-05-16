@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import datetime as datetime_module
 from io import BytesIO
 import hashlib
 import math
@@ -29,6 +30,7 @@ from app.models import (
     LearningItemAttachment,
     Notice,
     NoticeAttachment,
+    PresenceEligibilityLog,
     RegisteredDevice,
     ReportExport,
     User,
@@ -2217,9 +2219,6 @@ def resolve_mapped_classroom_for_course(db: Session, course_id: str) -> str:
 
 
 def list_presence_device_options(db: Session, classroom_code: str) -> list[dict]:
-    now = datetime.now()
-    weekday = now.weekday()
-    current_time = now.time()
     observed_rows = db.execute(
         select(
             RegisteredDevice.mac_address,
@@ -2233,9 +2232,9 @@ def list_presence_device_options(db: Session, classroom_code: str) -> list[dict]
         .join(Classroom, Classroom.id == CourseSchedule.classroom_id)
         .where(
             User.role == "student",
+            RegisteredDevice.status == "active",
             CourseEnrollment.status == "active",
             Classroom.classroom_code == classroom_code,
-            _active_schedule_window_filter(weekday, current_time),
         )
     )
 
@@ -2277,6 +2276,51 @@ def update_classroom_network_threshold(db: Session, network_id: int, signal_thre
     }
 
 
+def _parse_observed_at(value) -> datetime | None:
+    if value is None or isinstance(value, datetime_module.datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime_module.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def persist_presence_eligibility_log(
+    *,
+    db: Session,
+    student_id: str,
+    course_id: str,
+    classroom_code: str | None,
+    purpose: str,
+    result: dict,
+    commit: bool = True,
+) -> None:
+    student = db.scalar(select(User).where(User.student_id == student_id, User.role == "student"))
+    course = db.scalar(select(Course).where(Course.course_code == course_id))
+    classroom = None
+    if classroom_code:
+        classroom = db.scalar(select(Classroom).where(Classroom.classroom_code == classroom_code))
+    log = PresenceEligibilityLog(
+        student_user_id=student.id if student else None,
+        course_id=course.id if course else None,
+        classroom_id=classroom.id if classroom else None,
+        purpose=purpose,
+        eligible=bool(result.get("eligible")),
+        reason_code=result.get("reason_code") or result.get("reasonCode") or "UNKNOWN",
+        matched_device_mac=result.get("matched_device_mac") or result.get("matchedDeviceMac"),
+        evidence=result.get("evidence") or {},
+        observed_at=_parse_observed_at(result.get("observed_at") or result.get("observedAt")),
+        snapshot_age_seconds=result.get("snapshot_age_seconds", result.get("snapshotAgeSeconds")),
+    )
+    db.add(log)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+
+
 def check_attendance_eligibility(
     *,
     db: Session,
@@ -2292,7 +2336,7 @@ def check_attendance_eligibility(
     devices = [device for device in list_devices(db, student_id) if device.status == "active"]
     registered_devices = [{"mac": device.mac_address, "label": device.label} for device in devices]
     if not registered_devices:
-        return {
+        result = {
             "eligible": False,
             "reason_code": "DEVICE_NOT_REGISTERED",
             "matched_device_mac": None,
@@ -2300,10 +2344,19 @@ def check_attendance_eligibility(
             "snapshot_age_seconds": None,
             "evidence": {},
         }
+        persist_presence_eligibility_log(
+            db=db,
+            student_id=student_id,
+            course_id=course_id,
+            classroom_code=classroom_id,
+            purpose=purpose,
+            result=result,
+        )
+        return result
 
     # Exams keep the registered-device gate but do not depend on the current class window.
     if purpose == "exam":
-        return {
+        result = {
             "eligible": True,
             "reason_code": "OK",
             "matched_device_mac": registered_devices[0]["mac"],
@@ -2314,6 +2367,15 @@ def check_attendance_eligibility(
                 "registered_device_count": len(registered_devices),
             },
         }
+        persist_presence_eligibility_log(
+            db=db,
+            student_id=student_id,
+            course_id=course_id,
+            classroom_code=classroom_id,
+            purpose=purpose,
+            result=result,
+        )
+        return result
 
     try:
         # The generic student proximity check is not an attendance self check-in.
@@ -2322,7 +2384,7 @@ def check_attendance_eligibility(
         # gated by the attendance session flow.
         resolved_classroom_id = resolve_mapped_classroom_for_course(db, course_id)
     except HTTPException as exc:
-        return {
+        result = {
             "eligible": False,
             "reason_code": exc.detail["code"] if isinstance(exc.detail, dict) else "CLASSROOM_NOT_MAPPED",
             "matched_device_mac": None,
@@ -2330,6 +2392,15 @@ def check_attendance_eligibility(
             "snapshot_age_seconds": None,
             "evidence": exc.detail.get("details", {}) if isinstance(exc.detail, dict) else {},
         }
+        persist_presence_eligibility_log(
+            db=db,
+            student_id=student_id,
+            course_id=course_id,
+            classroom_code=classroom_id,
+            purpose=purpose,
+            result=result,
+        )
+        return result
 
     presence_payload = presence_client.check_eligibility(
         student_id=student_id,
@@ -2347,7 +2418,7 @@ def check_attendance_eligibility(
         registered_devices=registered_devices,
     )
 
-    return {
+    result = {
         "eligible": bool(presence_payload.get("eligible")),
         "reason_code": presence_payload.get("reasonCode", "UNKNOWN"),
         "matched_device_mac": presence_payload.get("matchedDeviceMac"),
@@ -2355,3 +2426,12 @@ def check_attendance_eligibility(
         "snapshot_age_seconds": presence_payload.get("snapshotAgeSeconds"),
         "evidence": presence_payload.get("evidence", {}),
     }
+    persist_presence_eligibility_log(
+        db=db,
+        student_id=student_id,
+        course_id=course_id,
+        classroom_code=resolved_classroom_id,
+        purpose=purpose,
+        result=result,
+    )
+    return result

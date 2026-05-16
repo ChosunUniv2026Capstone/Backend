@@ -22,6 +22,7 @@ from app.models import (
     Course,
     CourseEnrollment,
     CourseSchedule,
+    PresenceEligibilityLog,
     RegisteredDevice,
     User,
 )
@@ -413,7 +414,7 @@ def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() 
 
 
 def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle() -> None:
-    client, _, _ = make_client()
+    client, session_local, _ = make_client()
     first_projection_key = _first_projection_key(client)
     second_projection_key = _same_date_second_projection_key(client)
 
@@ -451,6 +452,13 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
     )
     assert report.status_code == 200
     assert report.json()["present"] == 2
+
+    with session_local() as db:
+        logs = db.query(PresenceEligibilityLog).order_by(PresenceEligibilityLog.id.asc()).all()
+        assert len(logs) == 4
+        assert {log.reason_code for log in logs} == {"OK"}
+        assert all(log.purpose == "attendance" for log in logs)
+        assert all(log.snapshot_age_seconds == 1 for log in logs)
 
 
 def test_bundle_student_active_sessions_are_grouped_into_one_card() -> None:
@@ -863,3 +871,7 @@ def test_student_check_in_rejects_ap_offline_without_present_record() -> None:
 
     with SessionLocal() as db:
         assert db.query(AttendanceRecord).filter_by(attendance_session_id=session_id, projection_key=projection_key).count() == 0
+        log = db.query(PresenceEligibilityLog).filter_by(reason_code="AP_OFFLINE").one()
+        assert log.eligible is False
+        assert log.classroom_id is not None
+        assert log.snapshot_age_seconds == 1
