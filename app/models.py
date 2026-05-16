@@ -1,6 +1,6 @@
 from datetime import datetime, time
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -153,6 +153,7 @@ class Assignment(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     opens_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    max_score: Mapped[float] = mapped_column(Numeric(8, 2), default=100)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -169,6 +170,11 @@ class AssignmentSubmission(Base):
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), index=True)
     student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     submission_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    score: Mapped[float | None] = mapped_column(Numeric(8, 2), nullable=True)
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graded_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    grading_status: Mapped[str] = mapped_column(String(20), default="submitted")
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -338,6 +344,47 @@ class LearningItemAttachment(Base):
     storage_key: Mapped[str] = mapped_column(String(700))
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CourseQnaThread(Base):
+    __tablename__ = "course_qna_threads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CourseQnaPost(Base):
+    __tablename__ = "course_qna_posts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_id: Mapped[int] = mapped_column(ForeignKey("course_qna_threads.id"), index=True)
+    author_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    body: Mapped[str] = mapped_column(Text)
+    post_type: Mapped[str] = mapped_column(String(20), default="comment")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearningProgress(Base):
+    __tablename__ = "learning_progress"
+    __table_args__ = (
+        UniqueConstraint("learning_item_id", "student_user_id"),
+        CheckConstraint("progress_percent >= 0 AND progress_percent <= 100", name="ck_learning_progress_percent_range"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    learning_item_id: Mapped[int] = mapped_column(ForeignKey("learning_items.id"), index=True)
+    student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    progress_percent: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    status: Mapped[str] = mapped_column(String(20), default="not_started")
+    last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class NoticeAttachment(Base):
