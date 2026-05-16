@@ -1,13 +1,16 @@
 from collections import defaultdict
 from datetime import UTC, datetime
+import json
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.assignments import (
     create_professor_assignment,
@@ -209,6 +212,133 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_ENVELOPE_HEADER_DROP = {b"content-length", b"content-type"}
+
+
+def _is_api_request(request: Request) -> bool:
+    return request.url.path.startswith("/api")
+
+
+def _is_success_envelope(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("success") is True and "data" in payload
+
+
+def _is_error_envelope(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict)
+
+
+def _is_enveloped_payload(payload: Any) -> bool:
+    return _is_success_envelope(payload) or _is_error_envelope(payload)
+
+
+def _success_envelope(payload: Any) -> dict[str, Any]:
+    if _is_enveloped_payload(payload):
+        return payload
+    return {
+        "success": True,
+        "data": payload,
+        "message": "ok",
+        "meta": {},
+    }
+
+
+def _json_response_with_preserved_headers(
+    *,
+    content: Any,
+    status_code: int,
+    raw_headers: list[tuple[bytes, bytes]],
+) -> Response:
+    response = JSONResponse(status_code=status_code, content=content)
+    preserved_headers = [(key, value) for key, value in raw_headers if key.lower() not in _ENVELOPE_HEADER_DROP]
+    response.raw_headers = preserved_headers + [
+        (key, value)
+        for key, value in response.raw_headers
+        if key.lower() in _ENVELOPE_HEADER_DROP
+    ]
+    return response
+
+
+def _default_error_code(status_code: int) -> str:
+    return {
+        status.HTTP_400_BAD_REQUEST: "BAD_REQUEST",
+        status.HTTP_401_UNAUTHORIZED: "UNAUTHENTICATED",
+        status.HTTP_403_FORBIDDEN: "FORBIDDEN",
+        status.HTTP_404_NOT_FOUND: "NOT_FOUND",
+        status.HTTP_405_METHOD_NOT_ALLOWED: "METHOD_NOT_ALLOWED",
+        status.HTTP_409_CONFLICT: "CONFLICT",
+        status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE: "RANGE_NOT_SATISFIABLE",
+        status.HTTP_422_UNPROCESSABLE_ENTITY: "VALIDATION_ERROR",
+    }.get(status_code, "REQUEST_FAILED")
+
+
+def _exception_detail_parts(status_code: int, detail: Any) -> tuple[str, str, dict[str, Any]]:
+    if isinstance(detail, dict):
+        return (
+            str(detail.get("code") or _default_error_code(status_code)),
+            str(detail.get("message") or "request failed"),
+            detail.get("details") if isinstance(detail.get("details"), dict) else {},
+        )
+    message = detail if isinstance(detail, str) and detail else "request failed"
+    return _default_error_code(status_code), message, {}
+
+
+@app.middleware("http")
+async def envelope_api_json_responses(request: Request, call_next):
+    response = await call_next(request)
+    if (
+        not _is_api_request(request)
+        or response.status_code == status.HTTP_204_NO_CONTENT
+        or response.headers.get("content-disposition")
+        or response.headers.get("accept-ranges")
+        or "application/json" not in response.headers.get("content-type", "").lower()
+    ):
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+    if not body:
+        return response
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+        )
+
+    if response.status_code < 400:
+        payload = _success_envelope(payload)
+    return _json_response_with_preserved_headers(
+        content=payload,
+        status_code=response.status_code,
+        raw_headers=list(response.raw_headers),
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def api_http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if not _is_api_request(request):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=getattr(exc, "headers", None))
+    code, message, details = _exception_detail_parts(exc.status_code, exc.detail)
+    return error_payload(exc.status_code, code, message, details)
+
+
+@app.exception_handler(RequestValidationError)
+async def api_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    if not _is_api_request(request):
+        return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": exc.errors()})
+    return error_payload(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "VALIDATION_ERROR",
+        "request validation failed",
+        {"errors": exc.errors()},
+    )
 
 
 class AttendanceRealtimeBroker:
