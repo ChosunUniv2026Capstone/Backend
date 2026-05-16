@@ -28,6 +28,9 @@ from app.models import (
 
 
 class FakePresenceClient:
+    def __init__(self) -> None:
+        self.reason_code = "OK"
+
     def check_eligibility(
         self,
         *,
@@ -39,8 +42,8 @@ class FakePresenceClient:
         registered_devices: list[dict],
     ) -> dict:
         return {
-            "eligible": True,
-            "reasonCode": "OK",
+            "eligible": self.reason_code == "OK",
+            "reasonCode": self.reason_code,
             "matchedDeviceMac": registered_devices[0]["mac"],
             "observedAt": "2026-04-07T15:05:00+00:00",
             "snapshotAgeSeconds": 1,
@@ -834,3 +837,29 @@ def test_bundle_realtime_events_publish_parent_session_with_all_projection_keys(
         assert closed_message["event_type"] == "attendance.session.closed"
         assert closed_message["projection_keys"] == [first_projection_key, second_projection_key]
         assert closed_message["session_ids"] == [session_id]
+
+
+def test_student_check_in_rejects_ap_offline_without_present_record() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_session(client, mode="smart")
+
+    active = client.get(
+        "/api/students/20201239/courses/CSE116/attendance/active-sessions",
+        headers=auth_header("20201239"),
+    )
+    assert active.status_code == 200
+    assert active.json()["sessions"][0]["can_check_in"] is False
+    assert active.json()["sessions"][0]["eligibility"]["per_slot"][0]["eligibility"]["reason_code"] == "AP_OFFLINE"
+
+    check_in = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+    assert check_in.status_code == 200
+    payload = check_in.json()
+    assert payload["status"] == "rejected"
+    assert payload["results"][0]["reason_code"] == "AP_OFFLINE"
+
+    with SessionLocal() as db:
+        assert db.query(AttendanceRecord).filter_by(attendance_session_id=session_id, projection_key=projection_key).count() == 0

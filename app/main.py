@@ -115,6 +115,9 @@ from app.services import (
     get_user_login_id,
     get_professor_exam_detail,
     get_student_exam_detail,
+    build_presence_registry,
+    issue_access_point_token,
+    list_access_points,
     list_classroom_networks,
     list_classroom_networks_for_classroom,
     list_classrooms,
@@ -134,6 +137,7 @@ from app.services import (
     start_student_exam,
     list_users,
     update_professor_exam,
+    revoke_access_point_token,
     update_classroom_network_threshold,
 )
 
@@ -1609,6 +1613,48 @@ def remove_device(
     require_student_self(student_id, current_user)
     delete_device(db, student_id, device_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+
+
+@app.get("/api/admin/access-points")
+def admin_list_access_points(
+    current_user: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return success_payload({"access_points": list_access_points(db)})
+
+
+@app.post("/api/admin/access-points/{collector_ap_id}/token")
+def admin_issue_access_point_token(
+    collector_ap_id: str,
+    current_user: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    token_payload = issue_access_point_token(db, collector_ap_id)
+    return success_payload(
+        token_payload,
+        message="AP token issued. Store this token now; it will not be shown again.",
+    )
+
+
+@app.delete("/api/admin/access-points/{collector_ap_id}/token")
+def admin_revoke_access_point_token(
+    collector_ap_id: str,
+    current_user: User = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return success_payload(revoke_access_point_token(db, collector_ap_id), message="AP token revoked")
+
+
+@app.get("/api/internal/presence/ap-registry")
+def internal_presence_ap_registry(
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not settings.presence_internal_token or x_internal_token != settings.presence_internal_token:
+        raise api_error(status.HTTP_401_UNAUTHORIZED, "INTERNAL_TOKEN_INVALID", "invalid internal token")
+    return build_presence_registry(db)
 
 
 @app.post(

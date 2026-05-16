@@ -14,7 +14,7 @@ from app.db import get_db
 from app.main import app
 from app.presence_client import PresenceClient
 import app.services as services_module
-from app.models import Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
+from app.models import AccessPoint, AccessPointInterface, Base, Classroom, ClassroomNetwork, Course, CourseEnrollment, CourseSchedule, Notice, RegisteredDevice, User
 
 from datetime import datetime, time, timedelta
 
@@ -160,6 +160,11 @@ def seed_backend_state(session: Session) -> None:
         ends_at=end_time,
     )
     session.add_all([network, device, enrollment, schedule])
+    session.flush()
+    access_point = AccessPoint(collector_ap_id="openwrt-a", label="Demo AP A / B101", management_ip="192.168.97.1", tailnet_ip="100.78.116.89", status="active")
+    session.add(access_point)
+    session.flush()
+    session.add(AccessPointInterface(access_point_id=access_point.id, interface_id="phy3-ap0", ssid="CU-B101-2G-2", classroom_network_id=network.id))
 
 
 
@@ -690,3 +695,34 @@ def test_admin_can_update_network_threshold() -> None:
     )
     assert response.status_code == 200
     assert response.json()["signal_threshold_dbm"] == -55
+
+
+def test_admin_can_issue_ap_token_and_internal_registry_exposes_hash_only() -> None:
+    client, _ = make_client()
+    issued = client.post("/api/admin/access-points/openwrt-a/token", headers=auth_header("ADM001"))
+    assert issued.status_code == 200
+    token_payload = issued.json()["data"]
+    assert token_payload["collector_ap_id"] == "openwrt-a"
+    assert token_payload["token"]
+
+    registry = client.get(
+        "/api/internal/presence/ap-registry",
+        headers={"X-Internal-Token": "smart-class-dev-internal-token"},
+    )
+    assert registry.status_code == 200
+    ap = registry.json()["accessPoints"][0]
+    assert ap["collectorApId"] == "openwrt-a"
+    assert ap["tokenHash"]
+    assert ap["tokenHash"] != token_payload["token"]
+    assert ap["interfaces"][0]["classroomId"] == "B101"
+    assert ap["interfaces"][0]["classroomNetworkApId"] == "phy3-ap0"
+
+
+def test_admin_can_revoke_ap_token() -> None:
+    client, _ = make_client()
+    assert client.post("/api/admin/access-points/openwrt-a/token", headers=auth_header("ADM001")).status_code == 200
+    revoked = client.delete("/api/admin/access-points/openwrt-a/token", headers=auth_header("ADM001"))
+    assert revoked.status_code == 200
+    listed = client.get("/api/admin/access-points", headers=auth_header("ADM001"))
+    assert listed.status_code == 200
+    assert listed.json()["data"]["access_points"][0]["token_configured"] is False
