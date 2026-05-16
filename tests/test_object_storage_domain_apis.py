@@ -1,4 +1,5 @@
 from __future__ import annotations
+from envelope import api_json
 
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
@@ -84,12 +85,12 @@ def test_learning_item_upload_download_and_cross_role_denial(tmp_path: Path) -> 
         files=[("files", ("intro.txt", b"hello learning", "text/plain"))],
     )
     assert response.status_code == 201, response.text
-    item = response.json()
+    item = api_json(response)
     assert item["attachments"][0]["original_filename"] == "intro.txt"
 
     listing = client.get("/api/students/20201239/courses/CSE116/learning-items", headers=auth_header("20201239"))
     assert listing.status_code == 200
-    assert listing.json()[0]["title"] == "Week 1"
+    assert api_json(listing)[0]["title"] == "Week 1"
 
     attachment_id = item["attachments"][0]["id"]
     download = client.get(
@@ -106,6 +107,28 @@ def test_learning_item_upload_download_and_cross_role_denial(tmp_path: Path) -> 
     assert denied.status_code == 403
 
 
+def test_json_learning_item_download_is_not_wrapped_by_api_envelope(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/learning-items",
+        headers=auth_header("PRF002"),
+        data={"kind": "material", "title": "JSON Data", "description": "Raw JSON file"},
+        files=[("files", ("data.json", b'{"x":1}', "application/json"))],
+    )
+    assert response.status_code == 201, response.text
+    item = api_json(response)
+    attachment_id = item["attachments"][0]["id"]
+
+    download = client.get(
+        f"/api/students/20201239/courses/CSE116/learning-items/{item['id']}/attachments/{attachment_id}",
+        headers=auth_header("20201239"),
+    )
+
+    assert download.status_code == 200
+    assert download.headers["content-disposition"].startswith("attachment;")
+    assert download.content == b'{"x":1}'
+
+
 def test_missing_learning_object_download_returns_404(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     response = client.post(
@@ -115,7 +138,7 @@ def test_missing_learning_object_download_returns_404(tmp_path: Path) -> None:
         files=[("files", ("intro.txt", b"hello learning", "text/plain"))],
     )
     assert response.status_code == 201, response.text
-    item = response.json()
+    item = api_json(response)
     attachment_id = item["attachments"][0]["id"]
     [stored_file] = [path for path in tmp_path.rglob("*") if path.is_file()]
     stored_file.unlink()
@@ -126,7 +149,7 @@ def test_missing_learning_object_download_returns_404(tmp_path: Path) -> None:
     )
 
     assert download.status_code == 404
-    assert download.json()["detail"]["code"] == "OBJECT_NOT_FOUND"
+    assert api_json(download)["detail"]["code"] == "OBJECT_NOT_FOUND"
 
 
 def test_notice_attachment_upload_failure_rolls_back_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,7 +169,7 @@ def test_notice_attachment_upload_failure_rolls_back_notice(tmp_path: Path, monk
 
     notices = client.get("/api/notices/PRF002", headers=auth_header("PRF002"))
     assert notices.status_code == 200
-    assert [notice["title"] for notice in notices.json()["data"]] == ["Seed"]
+    assert [notice["title"] for notice in api_json(notices)["data"]] == ["Seed"]
 
 
 def test_learning_item_delete_processes_deletion_outbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -160,7 +183,7 @@ def test_learning_item_delete_processes_deletion_outbox(tmp_path: Path, monkeypa
         files=[("files", ("intro.txt", b"hello learning", "text/plain"))],
     )
     assert response.status_code == 201, response.text
-    item = response.json()
+    item = api_json(response)
 
     delete_response = client.delete(
         f"/api/professors/PRF002/courses/CSE116/learning-items/{item['id']}",
@@ -180,7 +203,7 @@ def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:
         files=[("files", ("notice.txt", b"notice-body", "text/plain"))],
     )
     assert notice.status_code == 201, notice.text
-    notice_payload = notice.json()["data"]
+    notice_payload = api_json(notice)["data"]
     notice_attachment_id = notice_payload["attachments"][0]["id"]
     notice_download = client.get(
         f"/api/notices/20201239/{notice_payload['id']}/attachments/{notice_attachment_id}",
@@ -190,14 +213,14 @@ def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:
     assert notice_download.content == b"notice-body"
 
     exam_detail = client.get("/api/professors/PRF002/courses/CSE116/exams/1", headers=auth_header("PRF002"))
-    question_id = exam_detail.json()["questions"][0]["id"]
+    question_id = api_json(exam_detail)["questions"][0]["id"]
     media = client.post(
         f"/api/professors/PRF002/courses/CSE116/exams/1/questions/{question_id}/attachments",
         headers=auth_header("PRF002"),
         files=[("files", ("diagram.png", b"png-bytes", "image/png"))],
     )
     assert media.status_code == 201, media.text
-    media_id = media.json()[0]["id"]
+    media_id = api_json(media)[0]["id"]
     media_download = client.get(
         f"/api/students/20201239/courses/CSE116/exams/1/questions/{question_id}/attachments/{media_id}",
         headers=auth_header("20201239"),
@@ -211,10 +234,10 @@ def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:
         json={"export_type": "attendance_csv"},
     )
     assert export.status_code == 201, export.text
-    export_id = export.json()["id"]
+    export_id = api_json(export)["id"]
     exports = client.get("/api/professors/PRF002/courses/CSE116/attendance/report-exports", headers=auth_header("PRF002"))
     assert exports.status_code == 200
-    assert exports.json()[0]["id"] == export_id
+    assert api_json(exports)[0]["id"] == export_id
     download = client.get(
         f"/api/professors/PRF002/courses/CSE116/attendance/report-exports/{export_id}/download",
         headers=auth_header("PRF002"),

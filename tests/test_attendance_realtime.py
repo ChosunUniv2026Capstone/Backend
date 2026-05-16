@@ -1,4 +1,5 @@
 from __future__ import annotations
+from envelope import api_json
 
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
@@ -157,7 +158,7 @@ def _first_projection_key_for(client: TestClient, professor_id: str, course_code
         headers=auth_header(professor_id),
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     first_week = payload["weeks"][0]
     return first_week["slots"][0]["projection_key"]
 
@@ -172,7 +173,7 @@ def _same_date_second_projection_key(client: TestClient) -> str:
         headers=auth_header("PRF002"),
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     return payload["weeks"][0]["slots"][1]["projection_key"]
 
 
@@ -185,7 +186,7 @@ def _open_session_for(client: TestClient, professor_id: str, course_code: str, m
         json={"projection_keys": [projection_key], "mode": mode},
     )
     assert response.status_code == 200
-    result = response.json()["results"][0]
+    result = api_json(response)["results"][0]
     assert result["success"] is True
     return result["session_id"], projection_key
 
@@ -203,7 +204,7 @@ def _open_bundle_session(client: TestClient, mode: str = "smart") -> tuple[int, 
         json={"projection_keys": [first_projection_key, second_projection_key], "mode": mode},
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert payload["changed_session_ids"]
     return payload["changed_session_ids"][0], [first_projection_key, second_projection_key]
 
@@ -216,7 +217,7 @@ def test_professor_timeline_returns_semester_slots() -> None:
         headers=auth_header("PRF002"),
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert payload["course_code"] == "CSE116"
     assert payload["weeks"]
     assert payload["weeks"][0]["slots"][0]["display_label"]
@@ -239,7 +240,7 @@ def test_batch_open_reports_partial_duplicate_failure() -> None:
         json={"projection_keys": [projection_key, "CSE116:B101:2026-03-03:15:00:00:15:30:00"], "mode": "manual"},
     )
     assert second.status_code == 200
-    results = second.json()["results"]
+    results = api_json(second)["results"]
     assert results[0]["code"] == "SESSION_ALREADY_OPEN"
     assert results[1]["code"] == "SESSION_SLOT_INVALID"
 
@@ -254,7 +255,7 @@ def test_batch_open_rejects_cross_date_selection() -> None:
         json={"projection_keys": [projection_key, later_projection_key], "mode": "manual"},
     )
     assert response.status_code == 200
-    results = response.json()["results"]
+    results = api_json(response)["results"]
     assert results[0]["success"] is True
     assert results[1]["code"] == "SESSION_SLOT_INVALID"
 
@@ -269,7 +270,7 @@ def test_batch_open_accepts_same_date_multiple_slots() -> None:
         json={"projection_keys": [first_projection_key, second_projection_key], "mode": "manual"},
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert all(item["success"] is True for item in payload["results"])
     assert payload["changed_session_ids"] and len(payload["changed_session_ids"]) == 1
     assert {item["session_id"] for item in payload["results"]} == {payload["changed_session_ids"][0]}
@@ -278,7 +279,7 @@ def test_batch_open_accepts_same_date_multiple_slots() -> None:
         headers=auth_header("PRF002"),
     )
     assert timeline.status_code == 200
-    first_week_slots = timeline.json()["weeks"][0]["slots"][:2]
+    first_week_slots = api_json(timeline)["weeks"][0]["slots"][:2]
     assert {slot["session_id"] for slot in first_week_slots} == {payload["changed_session_ids"][0]}
     assert all(slot["bundle_slot_count"] == 2 for slot in first_week_slots)
     assert all(set(slot["bundle_projection_keys"]) == {first_projection_key, second_projection_key} for slot in first_week_slots)
@@ -296,7 +297,7 @@ def test_same_date_batch_open_creates_one_bundle_parent_and_memberships() -> Non
     )
 
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     session_ids = {item["session_id"] for item in payload["results"]}
     assert len(session_ids) == 1
     assert payload["changed_session_ids"] == [next(iter(session_ids))]
@@ -314,7 +315,7 @@ def test_same_date_batch_open_creates_one_bundle_parent_and_memberships() -> Non
         headers=auth_header("PRF002"),
     )
     assert timeline.status_code == 200
-    slots = timeline.json()["weeks"][0]["slots"][:2]
+    slots = api_json(timeline)["weeks"][0]["slots"][:2]
     assert slots[0]["session_id"] == slots[1]["session_id"] == session_id
     assert slots[0]["bundle_projection_keys"] == [first_projection_key, second_projection_key]
     assert slots[1]["bundle_projection_keys"] == [first_projection_key, second_projection_key]
@@ -330,14 +331,14 @@ def test_bundle_roster_defaults_to_anchor_absent_and_slot_preview_stays_slot_spe
         headers=auth_header("PRF002"),
         json={"projection_keys": [first_projection_key, second_projection_key], "mode": "manual"},
     )
-    session_id = open_response.json()["changed_session_ids"][0]
+    session_id = api_json(open_response)["changed_session_ids"][0]
 
     roster = client.get(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/roster",
         headers=auth_header("PRF002"),
     )
     assert roster.status_code == 200
-    roster_payload = roster.json()
+    roster_payload = api_json(roster)
     assert roster_payload["session"]["projection_keys"] == [first_projection_key, second_projection_key]
     assert all(student["final_status"] == "absent" for student in roster_payload["students"])
 
@@ -346,7 +347,7 @@ def test_bundle_roster_defaults_to_anchor_absent_and_slot_preview_stays_slot_spe
         headers=auth_header("PRF002"),
     )
     assert slot_preview.status_code == 200
-    preview_payload = slot_preview.json()
+    preview_payload = api_json(slot_preview)
     assert preview_payload["session"]["session_id"] == session_id
     assert preview_payload["session"]["projection_key"] == second_projection_key
     assert all(student["final_status"] == "absent" for student in preview_payload["students"])
@@ -363,7 +364,7 @@ def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() 
         headers=auth_header("PRF002"),
         json={"projection_keys": [first_projection_key, second_projection_key], "mode": "manual"},
     )
-    session_id = open_response.json()["changed_session_ids"][0]
+    session_id = api_json(open_response)["changed_session_ids"][0]
 
     bundle_update = client.patch(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
@@ -371,7 +372,7 @@ def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() 
         json={"status": "late", "reason": "지각 확인"},
     )
     assert bundle_update.status_code == 200
-    assert bundle_update.json()["projection_keys"] == [first_projection_key, second_projection_key]
+    assert api_json(bundle_update)["projection_keys"] == [first_projection_key, second_projection_key]
 
     repeat_update = client.patch(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
@@ -379,7 +380,7 @@ def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() 
         json={"status": "late", "reason": "지각 확인"},
     )
     assert repeat_update.status_code == 200
-    assert repeat_update.json()["changed"] is False
+    assert api_json(repeat_update)["changed"] is False
 
     slot_exception = client.patch(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
@@ -387,7 +388,7 @@ def test_bundle_professor_update_fans_out_and_slot_exception_is_slot_specific() 
         json={"status": "official", "reason": "공가 처리", "projection_key": second_projection_key},
     )
     assert slot_exception.status_code == 200
-    assert slot_exception.json()["projection_keys"] == [second_projection_key]
+    assert api_json(slot_exception)["projection_keys"] == [second_projection_key]
 
     with session_local() as db:
         records = (
@@ -423,14 +424,14 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
         headers=auth_header("PRF002"),
         json={"projection_keys": [first_projection_key, second_projection_key], "mode": "smart"},
     )
-    session_id = open_response.json()["changed_session_ids"][0]
+    session_id = api_json(open_response)["changed_session_ids"][0]
 
     first = client.post(
         f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
         headers=auth_header("20201239"),
     )
     assert first.status_code == 200
-    first_payload = first.json()
+    first_payload = api_json(first)
     assert first_payload["changed_count"] == 2
     assert first_payload["already_present_count"] == 0
     assert first_payload["rejected_count"] == 0
@@ -441,7 +442,7 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
         headers=auth_header("20201239"),
     )
     assert second.status_code == 200
-    second_payload = second.json()
+    second_payload = api_json(second)
     assert second_payload["idempotent"] is True
     assert second_payload["changed_count"] == 0
     assert second_payload["already_present_count"] == 2
@@ -451,7 +452,7 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
         headers=auth_header("PRF002"),
     )
     assert report.status_code == 200
-    assert report.json()["present"] == 2
+    assert api_json(report)["present"] == 2
 
     with session_local() as db:
         logs = db.query(PresenceEligibilityLog).order_by(PresenceEligibilityLog.id.asc()).all()
@@ -470,7 +471,7 @@ def test_bundle_student_active_sessions_are_grouped_into_one_card() -> None:
         headers=auth_header("20201239"),
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert len(payload["sessions"]) == 1
     session = payload["sessions"][0]
     assert session["session_id"] == session_id
@@ -518,7 +519,7 @@ def test_smart_close_materializes_missing_absences_and_clears_active_summary() -
         headers=auth_header("PRF002"),
     )
     assert roster.status_code == 200
-    roster_payload = roster.json()
+    roster_payload = api_json(roster)
     assert roster_payload["session"]["status"] == "closed"
     assert roster_payload["session"]["expires_at"] is None
     assert roster_payload["aggregate"]["present"] == 2
@@ -529,7 +530,7 @@ def test_smart_close_materializes_missing_absences_and_clears_active_summary() -
         headers=auth_header("PRF002"),
     )
     assert report.status_code == 200
-    report_payload = report.json()
+    report_payload = api_json(report)
     assert report_payload["active_session_count"] == 0
     assert report_payload["present"] == 2
     assert report_payload["absent"] == 2
@@ -539,7 +540,7 @@ def test_smart_close_materializes_missing_absences_and_clears_active_summary() -
         headers=auth_header("PRF002"),
     )
     assert timeline.status_code == 200
-    first_two_slots = timeline.json()["weeks"][0]["slots"][:2]
+    first_two_slots = api_json(timeline)["weeks"][0]["slots"][:2]
     assert {slot["projection_key"] for slot in first_two_slots} == set(projection_keys)
     assert all(slot["session_status"] == "closed" for slot in first_two_slots)
     assert all(slot["expires_at"] is None for slot in first_two_slots)
@@ -560,7 +561,7 @@ def test_professor_student_stats_return_course_semester_totals() -> None:
         headers=auth_header("PRF002"),
     )
     assert stats.status_code == 200
-    rows = {row["student_id"]: row for row in stats.json()["rows"]}
+    rows = {row["student_id"]: row for row in api_json(stats)["rows"]}
     assert rows["20201239"]["present"] == 1
     assert rows["20201239"]["absent"] == 0
     assert rows["20201240"]["present"] == 0
@@ -576,7 +577,7 @@ def test_student_semester_matrix_marks_pending_until_smart_close_then_absent() -
         headers=auth_header("20201240"),
     )
     assert matrix.status_code == 200
-    first_two = matrix.json()["weeks"][0]["slots"][:2]
+    first_two = api_json(matrix)["weeks"][0]["slots"][:2]
     assert {slot["projection_key"] for slot in first_two} == set(projection_keys)
     assert all(slot["status"] == "pending" for slot in first_two)
 
@@ -591,7 +592,7 @@ def test_student_semester_matrix_marks_pending_until_smart_close_then_absent() -
         headers=auth_header("20201240"),
     )
     assert matrix_after.status_code == 200
-    first_two_after = matrix_after.json()["weeks"][0]["slots"][:2]
+    first_two_after = api_json(matrix_after)["weeks"][0]["slots"][:2]
     assert all(slot["status"] == "absent" for slot in first_two_after)
 
 
@@ -604,21 +605,21 @@ def test_student_check_in_is_idempotent_and_updates_report() -> None:
         headers=auth_header("20201239"),
     )
     assert first.status_code == 200
-    assert first.json()["idempotent"] is False
+    assert api_json(first)["idempotent"] is False
 
     second = client.post(
         f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
         headers=auth_header("20201239"),
     )
     assert second.status_code == 200
-    assert second.json()["idempotent"] is True
+    assert api_json(second)["idempotent"] is True
 
     report = client.get(
         "/api/professors/PRF002/courses/CSE116/attendance/report",
         headers=auth_header("PRF002"),
     )
     assert report.status_code == 200
-    assert report.json()["present"] == 1
+    assert api_json(report)["present"] == 1
 
 
 
@@ -631,7 +632,7 @@ def test_professor_manual_update_rejects_empty_reason() -> None:
         json={"status": "late", "reason": ""},
     )
     assert response.status_code == 400
-    assert response.json()["detail"]["code"] == "ATTENDANCE_REASON_REQUIRED"
+    assert api_json(response)["detail"]["code"] == "ATTENDANCE_REASON_REQUIRED"
 
 
 
@@ -654,16 +655,16 @@ def test_professor_override_updates_history_and_report() -> None:
         headers=auth_header("PRF002"),
     )
     assert history.status_code == 200
-    assert len(history.json()["entries"]) == 2
-    assert history.json()["entries"][0]["new_status"] == "late"
+    assert len(api_json(history)["entries"]) == 2
+    assert api_json(history)["entries"][0]["new_status"] == "late"
 
     report = client.get(
         "/api/professors/PRF002/courses/CSE116/attendance/report",
         headers=auth_header("PRF002"),
     )
     assert report.status_code == 200
-    assert report.json()["late"] == 1
-    assert report.json()["present"] == 0
+    assert api_json(report)["late"] == 1
+    assert api_json(report)["present"] == 0
 
 
 def test_canceled_session_blocks_check_in_until_reopened() -> None:
@@ -681,7 +682,7 @@ def test_canceled_session_blocks_check_in_until_reopened() -> None:
         headers=auth_header("20201239"),
     )
     assert sessions.status_code == 200
-    assert sessions.json()["sessions"] == []
+    assert api_json(sessions)["sessions"] == []
 
     reopen = client.post(
         "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
@@ -689,7 +690,7 @@ def test_canceled_session_blocks_check_in_until_reopened() -> None:
         json={"projection_keys": [projection_key], "mode": "smart"},
     )
     assert reopen.status_code == 200
-    assert reopen.json()["results"][0]["event_type"] == "session.reopened"
+    assert api_json(reopen)["results"][0]["event_type"] == "session.reopened"
 
 
 def test_student_active_sessions_read_is_time_independent() -> None:
@@ -699,7 +700,7 @@ def test_student_active_sessions_read_is_time_independent() -> None:
         headers=auth_header("20201239"),
     )
     assert response.status_code == 200
-    assert response.json()["sessions"] == []
+    assert api_json(response)["sessions"] == []
 
 
 def test_student_active_sessions_reject_non_enrolled_course() -> None:
@@ -709,7 +710,7 @@ def test_student_active_sessions_reject_non_enrolled_course() -> None:
         headers=auth_header("20201239"),
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "FORBIDDEN"
+    assert api_json(response)["detail"]["code"] == "FORBIDDEN"
 
 
 def test_slot_roster_preview_returns_students_without_session() -> None:
@@ -720,7 +721,7 @@ def test_slot_roster_preview_returns_students_without_session() -> None:
         headers=auth_header("PRF002"),
     )
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert payload["session"]["projection_key"] == projection_key
     assert len(payload["students"]) == 2
 
@@ -732,7 +733,7 @@ def test_professor_timeline_rejects_non_owned_course() -> None:
         headers=auth_header("PRF002"),
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "FORBIDDEN"
+    assert api_json(response)["detail"]["code"] == "FORBIDDEN"
 
 
 def test_professor_slot_roster_rejects_non_owned_course() -> None:
@@ -743,7 +744,7 @@ def test_professor_slot_roster_rejects_non_owned_course() -> None:
         headers=auth_header("PRF002"),
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "FORBIDDEN"
+    assert api_json(response)["detail"]["code"] == "FORBIDDEN"
 
 
 def test_student_check_in_rejects_session_for_non_enrolled_course() -> None:
@@ -754,7 +755,7 @@ def test_student_check_in_rejects_session_for_non_enrolled_course() -> None:
         headers=auth_header("20201239"),
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "FORBIDDEN"
+    assert api_json(response)["detail"]["code"] == "FORBIDDEN"
 
 
 
@@ -828,7 +829,7 @@ def test_bundle_realtime_events_publish_parent_session_with_all_projection_keys(
             json={"projection_keys": [first_projection_key, second_projection_key], "mode": "smart"},
         )
         assert open_response.status_code == 200
-        session_id = open_response.json()["changed_session_ids"][0]
+        session_id = api_json(open_response)["changed_session_ids"][0]
 
         opened_message = websocket.receive_json()
         assert opened_message["event_type"] == "attendance.session.batch_applied"
@@ -857,15 +858,15 @@ def test_student_check_in_rejects_ap_offline_without_present_record() -> None:
         headers=auth_header("20201239"),
     )
     assert active.status_code == 200
-    assert active.json()["sessions"][0]["can_check_in"] is False
-    assert active.json()["sessions"][0]["eligibility"]["per_slot"][0]["eligibility"]["reason_code"] == "AP_OFFLINE"
+    assert api_json(active)["sessions"][0]["can_check_in"] is False
+    assert api_json(active)["sessions"][0]["eligibility"]["per_slot"][0]["eligibility"]["reason_code"] == "AP_OFFLINE"
 
     check_in = client.post(
         f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
         headers=auth_header("20201239"),
     )
     assert check_in.status_code == 200
-    payload = check_in.json()
+    payload = api_json(check_in)
     assert payload["status"] == "rejected"
     assert payload["results"][0]["reason_code"] == "AP_OFFLINE"
 

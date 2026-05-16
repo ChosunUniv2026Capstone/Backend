@@ -1,4 +1,5 @@
 from __future__ import annotations
+from envelope import api_json
 
 from collections.abc import Generator
 
@@ -181,10 +182,11 @@ def test_student_can_re_register_deleted_device() -> None:
     client, _ = make_client()
     devices = client.get("/api/students/20201239/devices", headers=auth_header("20201239"))
     assert devices.status_code == 200
-    device_id = devices.json()[0]["id"]
+    device_id = api_json(devices)[0]["id"]
 
     deleted = client.delete(f"/api/students/20201239/devices/{device_id}", headers=auth_header("20201239"))
     assert deleted.status_code == 204
+    assert deleted.content == b""
 
     recreated = client.post(
         "/api/students/20201239/devices",
@@ -193,9 +195,63 @@ def test_student_can_re_register_deleted_device() -> None:
     )
 
     assert recreated.status_code == 201
-    assert recreated.json()["id"] == device_id
-    assert recreated.json()["label"] == "Recovered Phone"
-    assert recreated.json()["status"] == "active"
+    assert api_json(recreated)["id"] == device_id
+    assert api_json(recreated)["label"] == "Recovered Phone"
+    assert api_json(recreated)["status"] == "active"
+
+
+def test_api_success_responses_are_enveloped() -> None:
+    client, _ = make_client()
+
+    response = client.get("/api/admin/users", headers=auth_header("ADM001"))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert isinstance(payload["data"], list)
+    assert payload["data"][0]["role"] in {"student", "professor", "admin"}
+    assert payload["message"] == "ok"
+    assert payload["meta"] == {}
+    assert "detail" not in payload
+
+
+def test_api_http_errors_are_enveloped_with_stable_codes() -> None:
+    client, _ = make_client()
+
+    unauthenticated = client.get("/api/admin/users")
+    forbidden = client.get("/api/admin/users", headers=auth_header("20201239"))
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {
+        "success": False,
+        "error": {
+            "code": "UNAUTHENTICATED",
+            "message": "authentication is required",
+            "details": {},
+        },
+    }
+    assert forbidden.status_code == 403
+    assert forbidden.json() == {
+        "success": False,
+        "error": {
+            "code": "FORBIDDEN",
+            "message": "admin role is required",
+            "details": {},
+        },
+    }
+
+
+def test_api_validation_errors_are_enveloped_with_stable_code() -> None:
+    client, _ = make_client()
+
+    response = client.post("/api/auth/login", json={})
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert payload["error"]["message"] == "request validation failed"
+    assert payload["error"]["details"]["errors"]
 
 
 def test_student_notice_list_includes_common_notices() -> None:
@@ -215,7 +271,7 @@ def test_student_notice_list_includes_common_notices() -> None:
     response = client.get("/api/notices/20201239", headers=auth_header("20201239"))
 
     assert response.status_code == 200
-    common = next(item for item in response.json()["data"] if item["title"] == "Common Notice")
+    common = next(item for item in api_json(response)["data"] if item["title"] == "Common Notice")
     assert common["course_code"] is None
 
 
@@ -243,7 +299,7 @@ def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     client, _ = make_client()
     response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     option = next(item for item in payload["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
     assert option["studentLoginId"] == "20201239"
     assert option["deviceLabel"] == "Choi Phone"
@@ -266,7 +322,7 @@ def test_admin_presence_snapshot_dropdown_ignores_current_schedule_window() -> N
     response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
 
     assert response.status_code == 200
-    option = next(item for item in response.json()["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
+    option = next(item for item in api_json(response)["deviceOptions"] if item["macAddress"] == "52:54:00:12:34:56")
     assert option["studentLoginId"] == "20201239"
     assert option["studentName"] == "Kim Student 06"
 
@@ -291,8 +347,8 @@ def test_generic_attendance_eligibility_uses_course_classroom_outside_window() -
         json={"student_id": "20201239", "course_code": "CSE116"},
     )
     assert response.status_code == 200
-    assert response.json()["eligible"] is True
-    assert response.json()["reason_code"] == "OK"
+    assert api_json(response)["eligible"] is True
+    assert api_json(response)["reason_code"] == "OK"
     assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
@@ -329,7 +385,7 @@ def test_generic_attendance_eligibility_uses_mapping_for_overnight_schedule(
     )
 
     assert response.status_code == 200
-    assert response.json()["eligible"] is True
+    assert api_json(response)["eligible"] is True
     assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
@@ -366,8 +422,8 @@ def test_generic_attendance_eligibility_uses_mapping_for_future_same_day_overnig
     )
 
     assert response.status_code == 200
-    assert response.json()["eligible"] is True
-    assert response.json()["reason_code"] == "OK"
+    assert api_json(response)["eligible"] is True
+    assert api_json(response)["reason_code"] == "OK"
     assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
@@ -402,7 +458,7 @@ def test_resolve_active_classroom_conflict_returns_not_eligible() -> None:
         json={"student_id": "20201239", "course_code": "CSE116"},
     )
     assert response.status_code == 200
-    assert response.json()["reason_code"] == "CLASSROOM_CONFLICT"
+    assert api_json(response)["reason_code"] == "CLASSROOM_CONFLICT"
 
 
 def auth_header(login_id: str) -> dict[str, str]:
@@ -415,14 +471,14 @@ def test_admin_routes_require_admin_role() -> None:
     assert client.get("/api/admin/users", headers=auth_header("20201239")).status_code == 403
     response = client.get("/api/admin/users", headers=auth_header("ADM001"))
     assert response.status_code == 200
-    assert len(response.json()) == 4
+    assert len(api_json(response)) == 4
 
 
 def test_invalid_access_token_returns_stable_auth_code() -> None:
     client, _ = make_client()
     response = client.get("/api/admin/users", headers={"Authorization": "Bearer not-a-dev-token"})
     assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+    assert api_json(response)["detail"]["code"] == "UNAUTHENTICATED"
 
 
 def test_student_routes_require_self() -> None:
@@ -437,7 +493,7 @@ def test_admin_presence_snapshot_enriches_owner_data() -> None:
     client, _ = make_client()
     response = client.get("/api/admin/presence/classrooms/B101/snapshot", headers=auth_header("ADM001"))
     assert response.status_code == 200
-    payload = response.json()
+    payload = api_json(response)
     assert payload["classroomCode"] == "B101"
     assert payload["classroomNetworks"][0]["signal_threshold_dbm"] is None
     station = payload["aps"][0]["stations"][0]
@@ -459,7 +515,7 @@ def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
     client, _ = make_client()
     login = client.post("/api/auth/login", json={"login_id": "20201239", "password": "devpass123"})
     assert login.status_code == 200
-    payload = login.json()
+    payload = api_json(login)
     assert payload["success"] is True
     assert payload["data"]["user"]["login_id"] == "20201239"
     assert payload["data"]["access_token"].count(".") == 2
@@ -473,7 +529,7 @@ def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:
 
     bootstrap = client.get("/api/auth/bootstrap")
     assert bootstrap.status_code == 200
-    bootstrap_payload = bootstrap.json()
+    bootstrap_payload = api_json(bootstrap)
     assert bootstrap_payload["success"] is True
     assert bootstrap_payload["meta"]["restored_via"] == "access-cookie"
     assert bootstrap_payload["data"]["user"]["login_id"] == "20201239"
@@ -487,7 +543,7 @@ def test_cookie_backed_access_allows_protected_route_without_authorization_heade
 
     response = client.get("/api/students/20201239/courses")
     assert response.status_code == 200
-    assert any(course["course_code"] == "CSE116" for course in response.json())
+    assert any(course["course_code"] == "CSE116" for course in api_json(response))
 
 
 def test_professor_courses_are_deduplicated_when_multiple_schedule_rows_exist() -> None:
@@ -515,7 +571,7 @@ def test_professor_courses_are_deduplicated_when_multiple_schedule_rows_exist() 
 
     response = client.get("/api/professors/PRF002/courses", headers=auth_header("PRF002"))
     assert response.status_code == 200
-    course_codes = [course["course_code"] for course in response.json()]
+    course_codes = [course["course_code"] for course in api_json(response)]
     assert course_codes.count("CSE116") == 1
 
 
@@ -544,7 +600,7 @@ def test_student_courses_are_deduplicated_when_multiple_schedule_rows_exist() ->
 
     response = client.get("/api/students/20201239/courses", headers=auth_header("20201239"))
     assert response.status_code == 200
-    course_codes = [course["course_code"] for course in response.json()]
+    course_codes = [course["course_code"] for course in api_json(response)]
     assert course_codes.count("CSE116") == 1
 
 
@@ -563,7 +619,7 @@ def test_refresh_rotates_cookie_and_rejects_replay() -> None:
     client.cookies.set("smartclass_refresh", first_refresh_cookie, domain="testserver.local", path="/api/auth")
     replay = client.post("/api/auth/refresh")
     assert replay.status_code == 401
-    assert replay.json()["error"]["code"] == "REFRESH_REPLAY_DETECTED"
+    assert api_json(replay)["error"]["code"] == "REFRESH_REPLAY_DETECTED"
 
 
 def test_local_dev_cors_allows_credentials_for_auth_routes() -> None:
@@ -587,11 +643,11 @@ def test_logout_revokes_cookie_backed_restore() -> None:
 
     logout = client.post("/api/auth/logout")
     assert logout.status_code == 200
-    assert logout.json()["data"]["logged_out"] is True
+    assert api_json(logout)["data"]["logged_out"] is True
 
     bootstrap = client.get("/api/auth/bootstrap")
     assert bootstrap.status_code == 401
-    assert bootstrap.json()["error"]["code"] == "UNAUTHENTICATED"
+    assert api_json(bootstrap)["error"]["code"] == "UNAUTHENTICATED"
 
 
 def test_expired_access_token_returns_stable_code() -> None:
@@ -612,7 +668,7 @@ def test_expired_access_token_returns_stable_code() -> None:
         headers={"Authorization": f"Bearer {expired_access}"},
     )
     assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "TOKEN_EXPIRED"
+    assert api_json(response)["detail"]["code"] == "TOKEN_EXPIRED"
 
 
 def test_invalid_access_token_returns_stable_unauthenticated_code() -> None:
@@ -622,7 +678,7 @@ def test_invalid_access_token_returns_stable_unauthenticated_code() -> None:
         headers={"Authorization": "Bearer not-a-valid-token"},
     )
     assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+    assert api_json(response)["detail"]["code"] == "UNAUTHENTICATED"
 
 
 def test_attendance_bootstrap_rejects_unauthorized_course_routes() -> None:
@@ -646,14 +702,14 @@ def test_attendance_bootstrap_rejects_unauthorized_course_routes() -> None:
         headers=auth_header("20201239"),
     )
     assert student_bootstrap.status_code == 403
-    assert student_bootstrap.json()["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
+    assert api_json(student_bootstrap)["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
 
     professor_bootstrap = client.get(
         "/api/professors/PRF002/courses/CSE999/attendance/bootstrap",
         headers=auth_header("PRF002"),
     )
     assert professor_bootstrap.status_code == 403
-    assert professor_bootstrap.json()["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
+    assert api_json(professor_bootstrap)["detail"]["code"] == "COURSE_ROUTE_FORBIDDEN"
 
 
 def test_admin_presence_overlay_proxies_payload() -> None:
@@ -711,7 +767,7 @@ def test_generic_attendance_eligibility_requires_student_self() -> None:
         },
     )
     assert allowed.status_code == 200
-    assert allowed.json()["eligible"] is True
+    assert api_json(allowed)["eligible"] is True
     assert fake_presence_client.last_eligibility_payload["classroom_id"] == "B101"
 
 
@@ -737,14 +793,14 @@ def test_admin_can_update_network_threshold() -> None:
         json={"signal_threshold_dbm": -55},
     )
     assert response.status_code == 200
-    assert response.json()["signal_threshold_dbm"] == -55
+    assert api_json(response)["signal_threshold_dbm"] == -55
 
 
 def test_admin_can_issue_ap_token_and_internal_registry_exposes_hash_only() -> None:
     client, _ = make_client()
     issued = client.post("/api/admin/access-points/openwrt-a/token", headers=auth_header("ADM001"))
     assert issued.status_code == 200
-    token_payload = issued.json()["data"]
+    token_payload = api_json(issued)["data"]
     assert token_payload["collector_ap_id"] == "openwrt-a"
     assert token_payload["token"]
 
@@ -753,7 +809,7 @@ def test_admin_can_issue_ap_token_and_internal_registry_exposes_hash_only() -> N
         headers={"X-Internal-Token": "smart-class-dev-internal-token"},
     )
     assert registry.status_code == 200
-    ap = registry.json()["accessPoints"][0]
+    ap = api_json(registry)["accessPoints"][0]
     assert ap["collectorApId"] == "openwrt-a"
     assert ap["tokenHash"]
     assert ap["tokenHash"] != token_payload["token"]
@@ -768,7 +824,7 @@ def test_admin_can_revoke_ap_token() -> None:
     assert revoked.status_code == 200
     listed = client.get("/api/admin/access-points", headers=auth_header("ADM001"))
     assert listed.status_code == 200
-    assert listed.json()["data"]["access_points"][0]["token_configured"] is False
+    assert api_json(listed)["data"]["access_points"][0]["token_configured"] is False
 
 
 def test_attendance_eligibility_persists_success_log() -> None:
@@ -819,7 +875,7 @@ def test_attendance_eligibility_persists_device_denial_log() -> None:
         json={"student_id": "20201239", "course_code": "CSE116"},
     )
     assert response.status_code == 200
-    assert response.json()["reason_code"] == "DEVICE_NOT_REGISTERED"
+    assert api_json(response)["reason_code"] == "DEVICE_NOT_REGISTERED"
 
     db = next(override())
     try:
@@ -842,8 +898,8 @@ def test_attendance_eligibility_persists_stale_snapshot_denial_log() -> None:
         json={"student_id": "20201239", "course_code": "CSE116"},
     )
     assert response.status_code == 200
-    assert response.json()["eligible"] is False
-    assert response.json()["reason_code"] == "SNAPSHOT_STALE"
+    assert api_json(response)["eligible"] is False
+    assert api_json(response)["reason_code"] == "SNAPSHOT_STALE"
 
     from app.db import get_db as backend_get_db
     from app.main import app as backend_app
@@ -879,7 +935,7 @@ def test_attendance_eligibility_persists_stale_snapshot_log() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["reason_code"] == "STALE_SNAPSHOT"
+    assert api_json(response)["reason_code"] == "STALE_SNAPSHOT"
 
     from app.db import get_db as backend_get_db
     from app.main import app as backend_app
