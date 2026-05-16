@@ -1533,10 +1533,11 @@ def patch_classroom_network_threshold(
 @app.get("/api/admin/presence/classrooms/{classroomCode}/snapshot", response_model=AdminPresenceSnapshotRead)
 def get_admin_presence_snapshot(
     classroomCode: str,
+    refresh: bool = False,
     _: User = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ) -> AdminPresenceSnapshotRead:
-    snapshot_payload = presence_client.get_admin_snapshot(classroom_code=classroomCode)
+    snapshot_payload = presence_client.get_admin_snapshot(classroom_code=classroomCode, refresh=refresh)
     return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
 
 
