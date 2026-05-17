@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.0...v0.5.1) (2026-05-17)
+
+
+### Bug Fixes
+
+* **backend:** normalize presence dependency outages ([f85810b](https://github.com/ChosunUniv2026Capstone/Backend/commit/f85810b2e1f03433c978b37f86ba7e0b22af90b1))
+
 ## [0.5.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.4.1...v0.5.0) (2026-05-16)
 
 
