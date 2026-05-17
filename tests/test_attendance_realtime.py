@@ -249,6 +249,37 @@ def test_batch_open_reports_partial_duplicate_failure() -> None:
     assert results[1]["code"] == "SESSION_SLOT_INVALID"
 
 
+def test_batch_open_smart_replaces_active_manual_session_for_same_slot() -> None:
+    client, SessionLocal, _ = make_client()
+    manual_session_id, projection_key = _open_session(client, mode="manual")
+
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={"projection_keys": [projection_key], "mode": "smart"},
+    )
+
+    assert response.status_code == 200
+    payload = api_json(response)
+    result = payload["results"][0]
+    assert result["success"] is True
+    assert result["code"] == "OK"
+    assert result["session_id"] != manual_session_id
+    assert payload["changed_session_ids"] == [result["session_id"]]
+
+    with SessionLocal() as db:
+        manual_session = db.get(AttendanceSession, manual_session_id)
+        smart_session = db.get(AttendanceSession, result["session_id"])
+        assert manual_session is not None
+        assert manual_session.mode == "manual"
+        assert manual_session.status == "closed"
+        assert manual_session.closed_at is not None
+        assert smart_session is not None
+        assert smart_session.mode == "smart"
+        assert smart_session.status == "active"
+        assert smart_session.expires_at is not None
+
+
 def test_batch_open_rejects_cross_date_selection() -> None:
     client, _, _ = make_client()
     projection_key = _first_projection_key(client)

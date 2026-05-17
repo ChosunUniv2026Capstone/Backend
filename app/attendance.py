@@ -723,6 +723,7 @@ def open_attendance_sessions_batch(
     valid_assignments: list[SessionSlotAssignment] = []
     target_session_date: date | None = None
     previous_sessions: dict[str, AttendanceSession | None] = {}
+    replaced_manual_sessions: dict[int, AttendanceSession] = {}
 
     for order, projection_key in enumerate(deduped_projection_keys):
         slot = slot_map.get(projection_key)
@@ -753,6 +754,7 @@ def open_attendance_sessions_batch(
             )
             continue
 
+        manual_session_to_replace: AttendanceSession | None = None
         active_existing = db.scalar(
             select(AttendanceSession)
             .outerjoin(AttendanceSessionSlot, AttendanceSessionSlot.attendance_session_id == AttendanceSession.id)
@@ -766,17 +768,20 @@ def open_attendance_sessions_batch(
             .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
         )
         if active_existing is not None:
-            results.append(
-                {
-                    "projection_key": projection_key,
-                    "success": False,
-                    "code": "SESSION_ALREADY_OPEN",
-                    "message": "an active session already exists for the projection key",
-                    "session_id": active_existing.id,
-                    "resulting_slot_state": _slot_state(active_existing),
-                }
-            )
-            continue
+            if mode == "smart" and active_existing.mode == "manual":
+                manual_session_to_replace = active_existing
+            else:
+                results.append(
+                    {
+                        "projection_key": projection_key,
+                        "success": False,
+                        "code": "SESSION_ALREADY_OPEN",
+                        "message": "an active session already exists for the projection key",
+                        "session_id": active_existing.id,
+                        "resulting_slot_state": _slot_state(active_existing),
+                    }
+                )
+                continue
 
         classroom_id = db.scalar(select(Classroom.id).where(Classroom.classroom_code == slot.classroom_code))
         if classroom_id is None:
@@ -803,9 +808,17 @@ def open_attendance_sessions_batch(
                 slot_order=order,
             )
         )
+        if manual_session_to_replace is not None:
+            replaced_manual_sessions[manual_session_to_replace.id] = manual_session_to_replace
         previous_sessions[projection_key] = _latest_session_for_projection(db, projection_key)
 
     if valid_assignments:
+        for replaced_session in replaced_manual_sessions.values():
+            replaced_session.status = "closed"
+            replaced_session.closed_at = now
+            replaced_session.expires_at = None
+            replaced_session.latest_version += 1
+
         anchor = valid_assignments[0]
         bundle_start_at, bundle_end_at = _bundle_bounds(valid_assignments)
         session = AttendanceSession(
