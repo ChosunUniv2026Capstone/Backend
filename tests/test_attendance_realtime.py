@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -247,6 +247,74 @@ def test_batch_open_reports_partial_duplicate_failure() -> None:
     results = api_json(second)["results"]
     assert results[0]["code"] == "SESSION_ALREADY_OPEN"
     assert results[1]["code"] == "SESSION_SLOT_INVALID"
+
+
+def test_batch_open_smart_replaces_active_manual_session_for_same_slot() -> None:
+    client, SessionLocal, _ = make_client()
+    manual_session_id, projection_key = _open_session(client, mode="manual")
+
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={"projection_keys": [projection_key], "mode": "smart"},
+    )
+
+    assert response.status_code == 200
+    payload = api_json(response)
+    result = payload["results"][0]
+    assert result["success"] is True
+    assert result["code"] == "OK"
+    assert result["session_id"] != manual_session_id
+    assert payload["changed_session_ids"] == [result["session_id"]]
+
+    with SessionLocal() as db:
+        manual_session = db.get(AttendanceSession, manual_session_id)
+        smart_session = db.get(AttendanceSession, result["session_id"])
+        assert manual_session is not None
+        assert manual_session.mode == "manual"
+        assert manual_session.status == "closed"
+        assert manual_session.closed_at is not None
+        assert smart_session is not None
+        assert smart_session.mode == "smart"
+        assert smart_session.status == "active"
+        assert smart_session.expires_at is not None
+
+
+def test_batch_open_smart_replaces_entire_active_manual_bundle() -> None:
+    client, SessionLocal, _ = make_client()
+    first_projection_key = _first_projection_key(client)
+    second_projection_key = _same_date_second_projection_key(client)
+    manual = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={"projection_keys": [first_projection_key, second_projection_key], "mode": "manual"},
+    )
+    assert manual.status_code == 200
+    manual_session_id = api_json(manual)["changed_session_ids"][0]
+
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={"projection_keys": [first_projection_key], "mode": "smart"},
+    )
+
+    assert response.status_code == 200
+    payload = api_json(response)
+    assert payload["changed_projection_keys"] == [first_projection_key, second_projection_key]
+    assert all(result["success"] for result in payload["results"])
+    smart_session_id = payload["changed_session_ids"][0]
+
+    with SessionLocal() as db:
+        manual_session = db.get(AttendanceSession, manual_session_id)
+        assert manual_session is not None
+        assert manual_session.status == "closed"
+        smart_assignments = db.scalars(
+            select(AttendanceSessionSlot).where(AttendanceSessionSlot.attendance_session_id == smart_session_id)
+        ).all()
+        assert [assignment.projection_key for assignment in smart_assignments] == [
+            first_projection_key,
+            second_projection_key,
+        ]
 
 
 def test_batch_open_rejects_cross_date_selection() -> None:
