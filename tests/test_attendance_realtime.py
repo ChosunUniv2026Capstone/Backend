@@ -695,16 +695,92 @@ def test_student_check_in_is_idempotent_and_updates_report() -> None:
 
 
 
-def test_professor_manual_update_rejects_empty_reason() -> None:
+def test_professor_official_update_rejects_empty_reason() -> None:
     client, _, _ = make_client()
     session_id, _ = _open_session(client, mode="manual")
     response = client.patch(
         f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
         headers=auth_header("PRF002"),
-        json={"status": "late", "reason": ""},
+        json={"status": "official", "reason": ""},
     )
     assert response.status_code == 400
     assert api_json(response)["detail"]["code"] == "ATTENDANCE_REASON_REQUIRED"
+
+
+@pytest.mark.parametrize("status", ["present", "late", "absent", "sick"])
+def test_professor_non_official_update_accepts_empty_reason(status: str) -> None:
+    client, session_local, _ = make_client()
+    session_id, _ = _open_session(client, mode="manual")
+    response = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": status, "reason": ""},
+    )
+    assert response.status_code == 200
+    assert api_json(response)["new_status"] == status
+    assert api_json(response)["reason"] is None
+
+    with session_local() as db:
+        record = db.scalar(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id == session_id))
+        audit = db.scalar(select(AttendanceStatusAuditLog).where(AttendanceStatusAuditLog.attendance_session_id == session_id))
+        assert record is not None
+        assert record.final_status == status
+        assert record.attendance_reason is None
+        assert audit is not None
+        assert audit.reason is None
+
+
+def test_professor_non_official_update_discards_supplied_reason() -> None:
+    client, session_local, _ = make_client()
+    session_id, _ = _open_session(client, mode="manual")
+    response = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "late", "reason": "이 사유는 저장하지 않음"},
+    )
+    assert response.status_code == 200
+    assert api_json(response)["reason"] is None
+
+    with session_local() as db:
+        record = db.scalar(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id == session_id))
+        audit = db.scalar(select(AttendanceStatusAuditLog).where(AttendanceStatusAuditLog.attendance_session_id == session_id))
+        assert record is not None
+        assert record.final_status == "late"
+        assert record.attendance_reason is None
+        assert audit is not None
+        assert audit.reason is None
+
+
+def test_professor_non_official_update_clears_previous_official_reason() -> None:
+    client, session_local, _ = make_client()
+    session_id, _ = _open_session(client, mode="manual")
+    official = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "official", "reason": "공결 증빙 확인"},
+    )
+    assert official.status_code == 200
+    assert api_json(official)["reason"] == "공결 증빙 확인"
+
+    present = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "present"},
+    )
+    assert present.status_code == 200
+    assert api_json(present)["reason"] is None
+
+    with session_local() as db:
+        record = db.scalar(select(AttendanceRecord).where(AttendanceRecord.attendance_session_id == session_id))
+        audits = db.scalars(
+            select(AttendanceStatusAuditLog)
+            .where(AttendanceStatusAuditLog.attendance_session_id == session_id)
+            .order_by(AttendanceStatusAuditLog.id.asc())
+        ).all()
+        assert record is not None
+        assert record.final_status == "present"
+        assert record.attendance_reason is None
+        assert [audit.reason for audit in audits] == ["공결 증빙 확인", None]
 
 
 
