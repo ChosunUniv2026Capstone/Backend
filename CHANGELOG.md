@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.2...v0.5.3) (2026-05-18)
+
+
+### Bug Fixes
+
+* require attendance reasons only for official status ([b24d0f4](https://github.com/ChosunUniv2026Capstone/Backend/commit/b24d0f4123bf07dd818df8f4ada2e809082eca54))
+
 ## [0.5.2](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.1...v0.5.2) (2026-05-17)
 
 
