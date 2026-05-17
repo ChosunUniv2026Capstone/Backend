@@ -1307,11 +1307,11 @@ def update_attendance_session_record(
     if new_status not in FINAL_STATUSES:
         raise attendance_api_error(400, "INVALID_ATTENDANCE_STATUS", "invalid attendance status", {"status": new_status})
     normalized_reason = (reason or "").strip()
-    if not normalized_reason:
+    if new_status == "official" and not normalized_reason:
         raise attendance_api_error(
             400,
             "ATTENDANCE_REASON_REQUIRED",
-            "attendance status changes require a non-empty reason",
+            "official attendance status changes require a non-empty reason",
         )
 
     professor = get_professor_user(db, professor_id)
@@ -1340,7 +1340,7 @@ def update_attendance_session_record(
     audit_rows: list[AttendanceStatusAuditLog] = []
     changed_projection_keys: list[str] = []
     now = _utcnow()
-    target_reason = normalized_reason or None
+    target_reason = normalized_reason if new_status == "official" else None
     for assignment in assignments:
         record = db.scalar(
             select(AttendanceRecord).where(
@@ -1400,7 +1400,7 @@ def update_attendance_session_record(
         "projection_keys": changed_projection_keys or [assignment.projection_key for assignment in assignments],
         "student_id": student_id,
         "new_status": new_status,
-        "reason": normalized_reason,
+        "reason": target_reason,
         "version": version,
         "course_code": course.course_code,
         "occurred_at": _serialize_dt(now),
