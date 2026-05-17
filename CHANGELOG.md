@@ -6,6 +6,7 @@
 ### Bug Fixes
 
 * allow professors to recover smart attendance after manual starts ([bd7cc09](https://github.com/ChosunUniv2026Capstone/Backend/commit/bd7cc094ccc0f4427ad4d060ffa4423f7101d030))
+* preserve manual bundle scope during smart recovery ([d8dbb61](https://github.com/ChosunUniv2026Capstone/Backend/commit/d8dbb61d98b4f7599ff7f5b393a48ee4de48e36d))
 
 ## [0.5.1](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.0...v0.5.1) (2026-05-17)
 
