@@ -320,6 +320,25 @@ def test_presence_client_maps_request_timeout_to_unavailable(monkeypatch: pytest
     exc = exc_info.value
     assert exc.status_code == 503
     assert exc.detail["code"] == "PRESENCE_SERVICE_UNAVAILABLE"
+    assert exc.detail["details"] == {"errorType": "ReadTimeout"}
+
+
+def test_presence_client_does_not_map_local_request_configuration_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(*args, **kwargs):
+        request = httpx.Request("POST", "ftp://presence/eligibility/check")
+        raise httpx.UnsupportedProtocol("unsupported protocol", request=request)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(httpx.UnsupportedProtocol):
+        PresenceClient("ftp://presence").check_eligibility(
+            student_id="20201239",
+            course_id="CSE116",
+            classroom_id="B101",
+            purpose="attendance",
+            classroom_networks=[{"apId": "phy3-ap0", "ssid": "CU-B101-2G-2", "signalThresholdDbm": -65}],
+            registered_devices=[{"mac": "52:54:00:12:34:56", "label": "Choi Phone"}],
+        )
 
 def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     client, _ = make_client()
@@ -985,7 +1004,7 @@ def test_attendance_eligibility_persists_presence_unavailable_log() -> None:
         detail={
             "code": "PRESENCE_SERVICE_UNAVAILABLE",
             "message": "presence service is unavailable",
-            "details": {"error": "timed out"},
+            "details": {"errorType": "ReadTimeout"},
         },
     )
 
@@ -1010,7 +1029,7 @@ def test_attendance_eligibility_persists_presence_unavailable_log() -> None:
         assert log is not None
         assert log.eligible is False
         assert log.evidence["dependencyUnavailable"] is True
-        assert log.evidence["upstreamDetails"]["error"] == "timed out"
+        assert log.evidence["upstreamDetails"] == {"errorType": "ReadTimeout"}
     finally:
         db.close()
 

@@ -9,6 +9,13 @@ PRESENCE_DEPENDENCY_UNAVAILABLE_CODES = {
     "COLLECTOR_REGISTRY_UNAVAILABLE",
 }
 
+PRESENCE_TRANSPORT_UNAVAILABLE_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.ProxyError,
+    httpx.RemoteProtocolError,
+)
+
 
 def _raise_presence_http_error(exc: httpx.HTTPStatusError) -> None:
     response = exc.response
@@ -35,12 +42,14 @@ def _raise_presence_http_error(exc: httpx.HTTPStatusError) -> None:
 
 
 def _raise_presence_request_error(exc: httpx.RequestError) -> None:
+    if not isinstance(exc, PRESENCE_TRANSPORT_UNAVAILABLE_ERRORS):
+        raise exc
     raise HTTPException(
         status_code=503,
         detail={
             "code": "PRESENCE_SERVICE_UNAVAILABLE",
             "message": "presence service is unavailable",
-            "details": {"error": str(exc)},
+            "details": {"errorType": exc.__class__.__name__},
         },
     ) from exc
 

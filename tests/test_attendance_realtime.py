@@ -889,7 +889,7 @@ def test_active_sessions_and_check_in_fail_closed_when_presence_unavailable() ->
         detail={
             "code": "PRESENCE_SERVICE_UNAVAILABLE",
             "message": "presence service is unavailable",
-            "details": {"error": "timed out"},
+            "details": {"errorType": "ReadTimeout"},
         },
     )
     session_id, projection_key = _open_session(client, mode="smart")
@@ -919,4 +919,4 @@ def test_active_sessions_and_check_in_fail_closed_when_presence_unavailable() ->
         log = db.query(PresenceEligibilityLog).filter_by(reason_code="PRESENCE_SERVICE_UNAVAILABLE").one()
         assert log.eligible is False
         assert log.evidence["dependencyUnavailable"] is True
-        assert log.evidence["upstreamDetails"]["error"] == "timed out"
+        assert log.evidence["upstreamDetails"] == {"errorType": "ReadTimeout"}
