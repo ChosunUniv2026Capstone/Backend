@@ -35,7 +35,11 @@ from app.models import (
     ReportExport,
     User,
 )
-from app.presence_client import PresenceClient
+from app.presence_client import (
+    PresenceClient,
+    is_presence_dependency_unavailable,
+    presence_dependency_unavailable_result,
+)
 from app.schemas import DeviceCreate
 from app.config import get_settings
 from app.storage import get_storage_backend, get_storage_backend_for_metadata, spool_limited_upload
@@ -2402,21 +2406,35 @@ def check_attendance_eligibility(
         )
         return result
 
-    presence_payload = presence_client.check_eligibility(
-        student_id=student_id,
-        course_id=course_id,
-        classroom_id=resolved_classroom_id,
-        purpose=purpose,
-        classroom_networks=[
-            {
-                "apId": network["ap_id"],
-                "ssid": network["ssid"],
-                "signalThresholdDbm": network["signal_threshold_dbm"],
-            }
-            for network in list_classroom_networks_for_classroom(db, resolved_classroom_id)
-        ],
-        registered_devices=registered_devices,
-    )
+    try:
+        presence_payload = presence_client.check_eligibility(
+            student_id=student_id,
+            course_id=course_id,
+            classroom_id=resolved_classroom_id,
+            purpose=purpose,
+            classroom_networks=[
+                {
+                    "apId": network["ap_id"],
+                    "ssid": network["ssid"],
+                    "signalThresholdDbm": network["signal_threshold_dbm"],
+                }
+                for network in list_classroom_networks_for_classroom(db, resolved_classroom_id)
+            ],
+            registered_devices=registered_devices,
+        )
+    except HTTPException as exc:
+        if not is_presence_dependency_unavailable(exc):
+            raise
+        result = presence_dependency_unavailable_result(exc, classroom_id=resolved_classroom_id)
+        persist_presence_eligibility_log(
+            db=db,
+            student_id=student_id,
+            course_id=course_id,
+            classroom_code=resolved_classroom_id,
+            purpose=purpose,
+            result=result,
+        )
+        return result
 
     result = {
         "eligible": bool(presence_payload.get("eligible")),
