@@ -719,6 +719,28 @@ def open_attendance_sessions_batch(
     slot_map = _projection_slot_lookup(db, course, professor)
     now = _utcnow()
     deduped_projection_keys = list(dict.fromkeys(projection_keys))
+    if mode == "smart":
+        requested_key_set = set(deduped_projection_keys)
+        for requested_projection_key in list(deduped_projection_keys):
+            active_manual_session = db.scalar(
+                select(AttendanceSession)
+                .outerjoin(AttendanceSessionSlot, AttendanceSessionSlot.attendance_session_id == AttendanceSession.id)
+                .where(
+                    AttendanceSession.status == "active",
+                    AttendanceSession.mode == "manual",
+                    or_(
+                        AttendanceSession.projection_key == requested_projection_key,
+                        AttendanceSessionSlot.projection_key == requested_projection_key,
+                    ),
+                )
+                .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
+            )
+            if active_manual_session is None:
+                continue
+            for assignment in _session_assignments_for_one(db, active_manual_session):
+                if assignment.projection_key not in requested_key_set:
+                    deduped_projection_keys.append(assignment.projection_key)
+                    requested_key_set.add(assignment.projection_key)
     results: list[dict[str, Any]] = []
     valid_assignments: list[SessionSlotAssignment] = []
     target_session_date: date | None = None
