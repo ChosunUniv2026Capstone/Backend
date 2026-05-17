@@ -23,7 +23,11 @@ from app.models import (
     RegisteredDevice,
     User,
 )
-from app.presence_client import PresenceClient
+from app.presence_client import (
+    PresenceClient,
+    is_presence_dependency_unavailable,
+    presence_dependency_unavailable_result,
+)
 
 SEMESTER_START = date(2026, 3, 3)
 SEMESTER_END = date(2026, 6, 30)
@@ -1488,21 +1492,30 @@ def _presence_eligibility_for_assignment(
         if persist_log:
             _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=result)
         return result
-    payload = presence_client.check_eligibility(
-        student_id=student.student_id or "",
-        course_id=course.course_code,
-        classroom_id=classroom.classroom_code if classroom else "",
-        purpose="attendance",
-        classroom_networks=[
-            {
-                "apId": network.ap_id,
-                "ssid": network.ssid,
-                "signalThresholdDbm": network.signal_threshold_dbm,
-            }
-            for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == assignment.classroom_id))
-        ],
-        registered_devices=registered_devices,
-    )
+    resolved_classroom_code = classroom.classroom_code if classroom else ""
+    try:
+        payload = presence_client.check_eligibility(
+            student_id=student.student_id or "",
+            course_id=course.course_code,
+            classroom_id=resolved_classroom_code,
+            purpose="attendance",
+            classroom_networks=[
+                {
+                    "apId": network.ap_id,
+                    "ssid": network.ssid,
+                    "signalThresholdDbm": network.signal_threshold_dbm,
+                }
+                for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == assignment.classroom_id))
+            ],
+            registered_devices=registered_devices,
+        )
+    except HTTPException as exc:
+        if not is_presence_dependency_unavailable(exc):
+            raise
+        result = presence_dependency_unavailable_result(exc, classroom_id=resolved_classroom_code)
+        if persist_log:
+            _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=result)
+        return result
     result = {
         "eligible": bool(payload.get("eligible")),
         "reason_code": payload.get("reasonCode", "UNKNOWN"),

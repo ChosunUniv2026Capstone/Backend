@@ -4,6 +4,7 @@ from envelope import api_json
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from sqlalchemy import create_engine
@@ -32,6 +33,7 @@ from app.models import (
 class FakePresenceClient:
     def __init__(self) -> None:
         self.reason_code = "OK"
+        self.next_exception = None
 
     def check_eligibility(
         self,
@@ -43,6 +45,8 @@ class FakePresenceClient:
         classroom_networks: list[dict],
         registered_devices: list[dict],
     ) -> dict:
+        if self.next_exception is not None:
+            raise self.next_exception
         return {
             "eligible": self.reason_code == "OK",
             "reasonCode": self.reason_code,
@@ -876,3 +880,43 @@ def test_student_check_in_rejects_ap_offline_without_present_record() -> None:
         assert log.eligible is False
         assert log.classroom_id is not None
         assert log.snapshot_age_seconds == 1
+
+
+def test_active_sessions_and_check_in_fail_closed_when_presence_unavailable() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.next_exception = HTTPException(
+        status_code=503,
+        detail={
+            "code": "PRESENCE_SERVICE_UNAVAILABLE",
+            "message": "presence service is unavailable",
+            "details": {"error": "timed out"},
+        },
+    )
+    session_id, projection_key = _open_session(client, mode="smart")
+
+    active = client.get(
+        "/api/students/20201239/courses/CSE116/attendance/active-sessions",
+        headers=auth_header("20201239"),
+    )
+
+    assert active.status_code == 200
+    session = api_json(active)["sessions"][0]
+    assert session["can_check_in"] is False
+    assert session["eligibility"]["per_slot"][0]["eligibility"]["reason_code"] == "PRESENCE_SERVICE_UNAVAILABLE"
+
+    check_in = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+
+    assert check_in.status_code == 200
+    payload = api_json(check_in)
+    assert payload["status"] == "rejected"
+    assert payload["results"][0]["reason_code"] == "PRESENCE_SERVICE_UNAVAILABLE"
+
+    with SessionLocal() as db:
+        assert db.query(AttendanceRecord).filter_by(attendance_session_id=session_id, projection_key=projection_key).count() == 0
+        log = db.query(PresenceEligibilityLog).filter_by(reason_code="PRESENCE_SERVICE_UNAVAILABLE").one()
+        assert log.eligible is False
+        assert log.evidence["dependencyUnavailable"] is True
+        assert log.evidence["upstreamDetails"]["error"] == "timed out"

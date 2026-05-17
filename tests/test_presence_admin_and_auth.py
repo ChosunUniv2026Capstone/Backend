@@ -5,6 +5,7 @@ from collections.abc import Generator
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
@@ -27,6 +28,7 @@ class FakePresenceClient:
         self.last_admin_refresh = None
         self.last_admin_source = None
         self.next_eligibility_response = None
+        self.next_eligibility_exception = None
         self.reason_code = "OK"
 
     def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False, source: str = "auto"):
@@ -93,6 +95,8 @@ class FakePresenceClient:
         assert course_id == "CSE116"
         assert classroom_id == "B101"
         assert classroom_networks[0]["apId"] == "phy3-ap0"
+        if self.next_eligibility_exception is not None:
+            raise self.next_eligibility_exception
         if self.next_eligibility_response is not None:
             return self.next_eligibility_response
         return {
@@ -294,6 +298,28 @@ def test_presence_client_maps_upstream_validation_error_to_http_exception(monkey
     assert getattr(exc, "status_code", None) == 400
     assert exc.detail["code"] == "INVALID_AP_ID"
     assert exc.detail["details"] == {"apId": "demo-ap"}
+
+
+def test_presence_client_maps_request_timeout_to_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_post(*args, **kwargs):
+        request = httpx.Request("POST", "http://presence/eligibility/check")
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(HTTPException) as exc_info:
+        PresenceClient("http://presence").check_eligibility(
+            student_id="20201239",
+            course_id="CSE116",
+            classroom_id="B101",
+            purpose="attendance",
+            classroom_networks=[{"apId": "phy3-ap0", "ssid": "CU-B101-2G-2", "signalThresholdDbm": -65}],
+            registered_devices=[{"mac": "52:54:00:12:34:56", "label": "Choi Phone"}],
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 503
+    assert exc.detail["code"] == "PRESENCE_SERVICE_UNAVAILABLE"
 
 def test_admin_presence_snapshot_dropdown_includes_registered_union() -> None:
     client, _ = make_client()
@@ -950,6 +976,67 @@ def test_attendance_eligibility_persists_stale_snapshot_log() -> None:
         assert log.evidence["snapshotStale"] is True
     finally:
         db.close()
+
+
+def test_attendance_eligibility_persists_presence_unavailable_log() -> None:
+    client, fake_presence = make_client()
+    fake_presence.next_eligibility_exception = HTTPException(
+        status_code=503,
+        detail={
+            "code": "PRESENCE_SERVICE_UNAVAILABLE",
+            "message": "presence service is unavailable",
+            "details": {"error": "timed out"},
+        },
+    )
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    payload = api_json(response)
+    assert payload["eligible"] is False
+    assert payload["reason_code"] == "PRESENCE_SERVICE_UNAVAILABLE"
+
+    from app.db import get_db as backend_get_db
+    from app.main import app as backend_app
+
+    override = backend_app.dependency_overrides[backend_get_db]
+    db = next(override())
+    try:
+        log = db.scalar(select(PresenceEligibilityLog).where(PresenceEligibilityLog.reason_code == "PRESENCE_SERVICE_UNAVAILABLE"))
+        assert log is not None
+        assert log.eligible is False
+        assert log.evidence["dependencyUnavailable"] is True
+        assert log.evidence["upstreamDetails"]["error"] == "timed out"
+    finally:
+        db.close()
+
+
+def test_attendance_eligibility_normalizes_registry_unavailable_reason() -> None:
+    client, fake_presence = make_client()
+    fake_presence.next_eligibility_exception = HTTPException(
+        status_code=503,
+        detail={
+            "code": "COLLECTOR_REGISTRY_UNAVAILABLE",
+            "message": "collector registry unavailable",
+            "details": {},
+        },
+    )
+
+    response = client.post(
+        "/api/attendance/eligibility",
+        headers=auth_header("20201239"),
+        json={"student_id": "20201239", "course_code": "CSE116"},
+    )
+
+    assert response.status_code == 200
+    payload = api_json(response)
+    assert payload["eligible"] is False
+    assert payload["reason_code"] == "PRESENCE_SERVICE_UNAVAILABLE"
+    assert payload["evidence"]["upstreamCode"] == "COLLECTOR_REGISTRY_UNAVAILABLE"
 
 
 def test_exam_presence_eligibility_persists_log() -> None:
