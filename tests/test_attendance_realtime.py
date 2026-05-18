@@ -72,13 +72,21 @@ def auth_header(login_id: str) -> dict[str, str]:
 
 
 
-def make_client() -> tuple[TestClient, sessionmaker, FakePresenceClient]:
+def make_client(*, session_class: type[Session] | None = None) -> tuple[TestClient, sessionmaker, FakePresenceClient]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    sessionmaker_kwargs = {
+        "bind": engine,
+        "autoflush": False,
+        "autocommit": False,
+        "expire_on_commit": False,
+    }
+    if session_class is not None:
+        sessionmaker_kwargs["class_"] = session_class
+    SessionLocal = sessionmaker(**sessionmaker_kwargs)
     Base.metadata.create_all(engine)
 
     with SessionLocal.begin() as session:
@@ -532,6 +540,34 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
         assert {log.reason_code for log in logs} == {"OK"}
         assert all(log.purpose == "attendance" for log in logs)
         assert all(log.snapshot_age_seconds == 1 for log in logs)
+
+
+def test_student_check_in_releases_db_before_presence_wait() -> None:
+    session_events = {"rollbacks": 0, "presence_checks": 0}
+
+    class TrackingSession(Session):
+        def rollback(self) -> None:
+            session_events["rollbacks"] += 1
+            super().rollback()
+
+    client, _, fake_presence = make_client(session_class=TrackingSession)
+    original_check_eligibility = fake_presence.check_eligibility
+
+    def assert_released_before_presence(**kwargs):
+        session_events["presence_checks"] += 1
+        assert session_events["rollbacks"] >= session_events["presence_checks"]
+        return original_check_eligibility(**kwargs)
+
+    fake_presence.check_eligibility = assert_released_before_presence
+    session_id, _ = _open_bundle_session(client, mode="smart")
+
+    response = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+
+    assert response.status_code == 200
+    assert session_events["presence_checks"] >= 1
 
 
 def test_bundle_student_active_sessions_are_grouped_into_one_card() -> None:

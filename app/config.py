@@ -6,6 +6,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     service_port: int = 8000
     database_url: str = "postgresql+psycopg://smartclass:smartclass@postgres:5432/smartclass"
+    db_pool_size: int = 20
+    db_max_overflow: int = 20
+    db_pool_timeout: float = 3.0
+    db_pool_recycle: int = 1800
+    db_pool_pre_ping: bool = True
     presence_service_url: str = "http://presence-service:8001"
     assignment_upload_dir: str = "storage/assignments"
     object_storage_provider: str = "local"
