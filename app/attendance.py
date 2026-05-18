@@ -1666,6 +1666,7 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
     already_present_count = 0
     rejected_count = 0
     per_slot_results: list[dict[str, Any]] = []
+    eligibility_results: list[tuple[SessionSlotAssignment, dict[str, Any]]] = []
 
     for assignment in assignments:
         eligibility = _presence_eligibility_for_assignment(
@@ -1675,9 +1676,13 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
             course,
             assignment,
             registered_devices,
-            persist_log=True,
-            release_connection_before_check=False,
+            persist_log=False,
+            release_connection_before_check=True,
         )
+        eligibility_results.append((assignment, eligibility))
+
+    for assignment, eligibility in eligibility_results:
+        _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=eligibility)
         if not eligibility["eligible"]:
             rejected_count += 1
             per_slot_results.append(

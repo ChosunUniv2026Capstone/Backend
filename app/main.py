@@ -4,11 +4,13 @@ import json
 from typing import Any
 from urllib.parse import quote
 
+import anyio
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select, text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -357,6 +359,28 @@ async def api_validation_exception_handler(request: Request, exc: RequestValidat
     )
 
 
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def sqlalchemy_timeout_exception_handler(request: Request, exc: SQLAlchemyTimeoutError) -> JSONResponse:
+    details = {"errorType": exc.__class__.__name__}
+    if not _is_api_request(request):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": {
+                    "code": "DB_POOL_EXHAUSTED",
+                    "message": "database connection pool is temporarily exhausted",
+                    "details": details,
+                }
+            },
+        )
+    return error_payload(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "DB_POOL_EXHAUSTED",
+        "database connection pool is temporarily exhausted",
+        details,
+    )
+
+
 class AttendanceRealtimeBroker:
     def __init__(self) -> None:
         self._connections: dict[str, set[WebSocket]] = defaultdict(set)
@@ -386,13 +410,40 @@ class AttendanceRealtimeBroker:
                 continue
             try:
                 await websocket.send_json(payload)
-            except RuntimeError:
+            except (RuntimeError, WebSocketDisconnect):
                 stale.append(websocket)
         for websocket in stale:
             self.disconnect(course_code, websocket)
 
 
 attendance_broker = AttendanceRealtimeBroker()
+
+
+def _release_db_connection(db: Session) -> None:
+    # This helper intentionally rolls back the current SQLAlchemy transaction to
+    # return the checked-out connection before external waits or websocket
+    # publishes. Call it only after read-only work or after mutation helpers have
+    # already committed their durable state.
+    if db.in_transaction():
+        db.rollback()
+
+
+def _publish_attendance_sync(course_code: str, payload: dict[str, Any]) -> None:
+    anyio.from_thread.run(attendance_broker.publish, course_code, payload)
+
+
+def _publish_expired_attendance_events_sync(expired_events: list[dict[str, Any]]) -> None:
+    for event in expired_events:
+        _publish_attendance_sync(
+            event["course_code"],
+            attendance_event_payload(
+                event_type=event["event_type"],
+                course_code=event["course_code"],
+                projection_keys=event.get("projection_keys", [event["projection_key"]]),
+                session_ids=[event["session_id"]],
+                version=event["version"],
+            ),
+        )
 
 
 def api_error(status_code: int, code: str, message: str, details: dict | None = None) -> HTTPException:
@@ -816,7 +867,12 @@ def map_presence_snapshot(snapshot_payload: dict, db: Session) -> dict:
 
 
 @app.get("/health", response_model=HealthResponse)
-def health(db: Session = Depends(get_db)) -> HealthResponse:
+async def health() -> HealthResponse:
+    return HealthResponse(status="ok")
+
+
+@app.get("/ready", response_model=HealthResponse)
+def ready(db: Session = Depends(get_db)) -> HealthResponse:
     db.execute(text("SELECT 1"))
     return HealthResponse(status="ok")
 
@@ -1636,7 +1692,7 @@ def save_student_course_exam_answer(
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/attendance/bootstrap")
-async def student_attendance_bootstrap(
+def student_attendance_bootstrap(
     student_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -1644,17 +1700,8 @@ async def student_attendance_bootstrap(
 ) -> dict[str, Any]:
     student, course = require_student_route_bootstrap_access(student_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-        )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return success_payload(
         {
             "user": serialize_auth_user(student).model_dump(),
@@ -1670,7 +1717,7 @@ async def student_attendance_bootstrap(
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/bootstrap")
-async def professor_attendance_bootstrap(
+def professor_attendance_bootstrap(
     professor_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -1678,17 +1725,8 @@ async def professor_attendance_bootstrap(
 ) -> dict[str, Any]:
     professor, course = require_professor_route_bootstrap_access(professor_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-        )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     timeline = build_attendance_timeline(db, professor_id, course_code)
     return success_payload(
         {
@@ -1969,7 +2007,7 @@ def attendance_eligibility(
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/timeline")
-async def professor_attendance_timeline(
+def professor_attendance_timeline(
     professor_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -1977,22 +2015,13 @@ async def professor_attendance_timeline(
 ) -> dict[str, Any]:
     require_professor_course_ownership(professor_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-        )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return build_attendance_timeline(db, professor_id, course_code)
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/report")
-async def professor_attendance_report(
+def professor_attendance_report(
     professor_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -2000,22 +2029,13 @@ async def professor_attendance_report(
 ) -> dict[str, Any]:
     require_professor_course_ownership(professor_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-    )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return build_attendance_report(db, professor_id, course_code)
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/student-stats")
-async def professor_attendance_student_stats(
+def professor_attendance_student_stats(
     professor_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -2023,17 +2043,8 @@ async def professor_attendance_student_stats(
 ) -> dict[str, Any]:
     require_professor_course_ownership(professor_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-        )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return build_professor_student_attendance_stats(db, professor_id, course_code)
 
 
@@ -2073,7 +2084,7 @@ def download_professor_attendance_report_export(
 
 
 @app.post("/api/professors/{professor_id}/courses/{course_code}/attendance/sessions/batch")
-async def professor_open_attendance_sessions_batch(
+def professor_open_attendance_sessions_batch(
     professor_id: str,
     course_code: str,
     payload: AttendanceSessionBatchRequest,
@@ -2088,7 +2099,8 @@ async def professor_open_attendance_sessions_batch(
         projection_keys=payload.projection_keys,
         mode=payload.mode,
     )
-    await attendance_broker.publish(
+    _release_db_connection(db)
+    _publish_attendance_sync(
         course_code,
         attendance_event_payload(
             event_type="attendance.session.batch_applied",
@@ -2102,7 +2114,7 @@ async def professor_open_attendance_sessions_batch(
 
 
 @app.post("/api/professors/{professor_id}/attendance/sessions/{session_id}/close")
-async def professor_close_attendance(
+def professor_close_attendance(
     professor_id: str,
     session_id: int,
     current_user: User = Depends(require_authenticated_user),
@@ -2111,7 +2123,8 @@ async def professor_close_attendance(
     require_professor_self(professor_id, current_user)
     result = close_attendance_session(db, professor_id, session_id)
     if "course_code" in result:
-        await attendance_broker.publish(
+        _release_db_connection(db)
+        _publish_attendance_sync(
             result["course_code"],
             attendance_event_payload(
                 event_type="attendance.session.closed",
@@ -2148,7 +2161,7 @@ def professor_attendance_slot_roster(
 
 
 @app.patch("/api/professors/{professor_id}/attendance/sessions/{session_id}/students/{student_id}")
-async def professor_update_attendance_record(
+def professor_update_attendance_record(
     professor_id: str,
     session_id: int,
     student_id: str,
@@ -2167,7 +2180,8 @@ async def professor_update_attendance_record(
         payload.projection_key,
     )
     if result.get("changed", True):
-        await attendance_broker.publish(
+        _release_db_connection(db)
+        _publish_attendance_sync(
             result["course_code"],
             attendance_event_payload(
                 event_type="attendance.record.updated",
@@ -2198,7 +2212,7 @@ def professor_attendance_student_history(
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/attendance/active-sessions")
-async def student_active_attendance_sessions(
+def student_active_attendance_sessions(
     student_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -2206,22 +2220,13 @@ async def student_active_attendance_sessions(
 ) -> dict[str, Any]:
     require_student_course_access(student_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-    )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return list_student_active_attendance_sessions(db, presence_client, student_id, course_code)
 
 
 @app.get("/api/students/{student_id}/courses/{course_code}/attendance/semester-matrix")
-async def student_attendance_semester_matrix(
+def student_attendance_semester_matrix(
     student_id: str,
     course_code: str,
     current_user: User = Depends(require_authenticated_user),
@@ -2229,22 +2234,13 @@ async def student_attendance_semester_matrix(
 ) -> dict[str, Any]:
     require_student_course_access(student_id, course_code, current_user, db)
     expired_events = expire_stale_attendance_sessions(db, course_code)
-    for event in expired_events:
-        await attendance_broker.publish(
-            event["course_code"],
-            attendance_event_payload(
-                event_type=event["event_type"],
-                course_code=event["course_code"],
-                projection_keys=event.get("projection_keys", [event["projection_key"]]),
-                session_ids=[event["session_id"]],
-                version=event["version"],
-            ),
-        )
+    _release_db_connection(db)
+    _publish_expired_attendance_events_sync(expired_events)
     return build_student_attendance_semester_matrix(db, student_id, course_code)
 
 
 @app.post("/api/students/{student_id}/attendance/sessions/{session_id}/check-in")
-async def student_attendance_check_in_endpoint(
+def student_attendance_check_in_endpoint(
     student_id: str,
     session_id: int,
     current_user: User = Depends(require_authenticated_user),
@@ -2252,25 +2248,27 @@ async def student_attendance_check_in_endpoint(
 ) -> dict[str, Any]:
     require_student_self(student_id, current_user)
     result = student_attendance_check_in(db, presence_client, student_id, session_id)
-    await attendance_broker.publish(
-        result["course_code"],
-        attendance_event_payload(
-            event_type="attendance.student.checked_in",
-            course_code=result["course_code"],
-            projection_keys=result.get("projection_keys", [result["projection_key"]]),
-            session_ids=[result["session_id"]],
-            version=result["version"],
-            changed_payload={
-                "student_id": result["student_id"],
-                "status": result["status"],
-                "idempotent": result["idempotent"],
-                "changed_count": result.get("changed_count"),
-                "already_present_count": result.get("already_present_count"),
-                "rejected_count": result.get("rejected_count"),
-                "projection_keys": result.get("projection_keys", []),
-            },
-        ),
-    )
+    _release_db_connection(db)
+    if result.get("changed_count", 0) > 0:
+        _publish_attendance_sync(
+            result["course_code"],
+            attendance_event_payload(
+                event_type="attendance.student.checked_in",
+                course_code=result["course_code"],
+                projection_keys=result.get("projection_keys", [result["projection_key"]]),
+                session_ids=[result["session_id"]],
+                version=result["version"],
+                changed_payload={
+                    "student_id": result["student_id"],
+                    "status": result["status"],
+                    "idempotent": result["idempotent"],
+                    "changed_count": result.get("changed_count"),
+                    "already_present_count": result.get("already_present_count"),
+                    "rejected_count": result.get("rejected_count"),
+                    "projection_keys": result.get("projection_keys", []),
+                },
+            ),
+        )
     return result
 
 
