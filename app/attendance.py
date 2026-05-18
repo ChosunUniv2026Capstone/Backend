@@ -1513,8 +1513,11 @@ def _presence_eligibility_for_assignment(
     assignment: SessionSlotAssignment,
     registered_devices: list[dict[str, str]],
     persist_log: bool = False,
+    release_connection_before_check: bool = True,
 ) -> dict[str, Any]:
     classroom = db.scalar(select(Classroom).where(Classroom.id == assignment.classroom_id))
+    student_login_id = student.student_id or ""
+    course_code = course.course_code
     if not registered_devices:
         result = {
             "eligible": False,
@@ -1528,20 +1531,26 @@ def _presence_eligibility_for_assignment(
             _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=result)
         return result
     resolved_classroom_code = classroom.classroom_code if classroom else ""
+    classroom_networks = [
+        {
+            "apId": network.ap_id,
+            "ssid": network.ssid,
+            "signalThresholdDbm": network.signal_threshold_dbm,
+        }
+        for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == assignment.classroom_id))
+    ]
+    if release_connection_before_check:
+        # The active-session listing path is read-only. Return its DB
+        # connection before waiting on PresenceService so dashboard/student
+        # polling cannot exhaust the backend pool during AP outages.
+        db.rollback()
     try:
         payload = presence_client.check_eligibility(
-            student_id=student.student_id or "",
-            course_id=course.course_code,
+            student_id=student_login_id,
+            course_id=course_code,
             classroom_id=resolved_classroom_code,
             purpose="attendance",
-            classroom_networks=[
-                {
-                    "apId": network.ap_id,
-                    "ssid": network.ssid,
-                    "signalThresholdDbm": network.signal_threshold_dbm,
-                }
-                for network in db.scalars(select(ClassroomNetwork).where(ClassroomNetwork.classroom_id == assignment.classroom_id))
-            ],
+            classroom_networks=classroom_networks,
             registered_devices=registered_devices,
         )
     except HTTPException as exc:
@@ -1657,6 +1666,7 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
     already_present_count = 0
     rejected_count = 0
     per_slot_results: list[dict[str, Any]] = []
+    eligibility_results: list[tuple[SessionSlotAssignment, dict[str, Any]]] = []
 
     for assignment in assignments:
         eligibility = _presence_eligibility_for_assignment(
@@ -1666,8 +1676,13 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
             course,
             assignment,
             registered_devices,
-            persist_log=True,
+            persist_log=False,
+            release_connection_before_check=True,
         )
+        eligibility_results.append((assignment, eligibility))
+
+    for assignment, eligibility in eligibility_results:
+        _persist_attendance_presence_log(db, student=student, course=course, assignment=assignment, result=eligibility)
         if not eligibility["eligible"]:
             rejected_count += 1
             per_slot_results.append(

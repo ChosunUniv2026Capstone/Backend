@@ -72,13 +72,21 @@ def auth_header(login_id: str) -> dict[str, str]:
 
 
 
-def make_client() -> tuple[TestClient, sessionmaker, FakePresenceClient]:
+def make_client(*, session_class: type[Session] | None = None) -> tuple[TestClient, sessionmaker, FakePresenceClient]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    sessionmaker_kwargs = {
+        "bind": engine,
+        "autoflush": False,
+        "autocommit": False,
+        "expire_on_commit": False,
+    }
+    if session_class is not None:
+        sessionmaker_kwargs["class_"] = session_class
+    SessionLocal = sessionmaker(**sessionmaker_kwargs)
     Base.metadata.create_all(engine)
 
     with SessionLocal.begin() as session:
@@ -534,6 +542,34 @@ def test_bundle_student_check_in_updates_each_slot_and_is_idempotent_per_bundle(
         assert all(log.snapshot_age_seconds == 1 for log in logs)
 
 
+def test_student_check_in_releases_db_before_presence_wait() -> None:
+    session_events = {"rollbacks": 0, "presence_checks": 0}
+
+    class TrackingSession(Session):
+        def rollback(self) -> None:
+            session_events["rollbacks"] += 1
+            super().rollback()
+
+    client, _, fake_presence = make_client(session_class=TrackingSession)
+    original_check_eligibility = fake_presence.check_eligibility
+
+    def assert_released_before_presence(**kwargs):
+        session_events["presence_checks"] += 1
+        assert session_events["rollbacks"] >= session_events["presence_checks"]
+        return original_check_eligibility(**kwargs)
+
+    fake_presence.check_eligibility = assert_released_before_presence
+    session_id, _ = _open_bundle_session(client, mode="smart")
+
+    response = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+
+    assert response.status_code == 200
+    assert session_events["presence_checks"] >= 1
+
+
 def test_bundle_student_active_sessions_are_grouped_into_one_card() -> None:
     client, _, _ = make_client()
     session_id, projection_keys = _open_bundle_session(client, mode="smart")
@@ -934,6 +970,33 @@ def test_professor_websocket_bootstrap_delivers_timeline() -> None:
         message = websocket.receive_json()
         assert message["event_type"] == "attendance.bootstrap"
         assert message["changed_payload"]["data"]["course_code"] == "CSE116"
+
+
+def test_attendance_websocket_releases_bootstrap_db_session_while_connected() -> None:
+    client, SessionLocal, _ = make_client()
+    session_events = {"closes": 0}
+
+    class TrackingSession(Session):
+        def close(self) -> None:
+            session_events["closes"] += 1
+            super().close()
+
+    tracking_session_factory = sessionmaker(
+        bind=SessionLocal.kw["bind"],
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        class_=TrackingSession,
+    )
+
+    from app import main as main_module
+
+    main_module.SessionLocal = tracking_session_factory
+
+    with client.websocket_connect("/ws/attendance?token=dev-token:PRF002&courseCode=CSE116&view=professor") as websocket:
+        message = websocket.receive_json()
+        assert message["event_type"] == "attendance.bootstrap"
+        assert session_events["closes"] >= 1
 
 
 def test_admin_report_websocket_bootstrap_is_allowed() -> None:
