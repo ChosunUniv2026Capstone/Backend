@@ -15,4 +15,6 @@ def get_db() -> Generator[Session, None, None]:
     try:
         yield db
     finally:
+        if db.in_transaction():
+            db.rollback()
         db.close()

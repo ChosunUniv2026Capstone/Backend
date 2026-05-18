@@ -29,12 +29,15 @@ class FakePresenceClient:
         self.last_admin_source = None
         self.next_eligibility_response = None
         self.next_eligibility_exception = None
+        self.on_admin_snapshot_request = None
         self.reason_code = "OK"
 
     def get_admin_snapshot(self, *, classroom_code: str, refresh: bool = False, source: str = "auto"):
         assert classroom_code == "B101"
         self.last_admin_refresh = refresh
         self.last_admin_source = source
+        if self.on_admin_snapshot_request is not None:
+            self.on_admin_snapshot_request()
         return {
             "cacheHit": False,
             "overlayActive": True,
@@ -109,13 +112,21 @@ class FakePresenceClient:
         }
 
 
-def make_client() -> tuple[TestClient, FakePresenceClient]:
+def make_client(*, session_class: type[Session] | None = None) -> tuple[TestClient, FakePresenceClient]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    sessionmaker_kwargs = {
+        "bind": engine,
+        "autoflush": False,
+        "autocommit": False,
+        "expire_on_commit": False,
+    }
+    if session_class is not None:
+        sessionmaker_kwargs["class_"] = session_class
+    SessionLocal = sessionmaker(**sessionmaker_kwargs)
     Base.metadata.create_all(engine)
 
     with SessionLocal.begin() as session:
@@ -554,6 +565,26 @@ def test_admin_presence_snapshot_forwards_refresh_flag() -> None:
     assert response.status_code == 200
     assert fake_presence.last_admin_refresh is True
     assert fake_presence.last_admin_source == "demo"
+
+
+def test_admin_presence_snapshot_releases_db_transaction_before_presence_wait() -> None:
+    session_events = {"rollbacks": 0}
+
+    class TrackingSession(Session):
+        def rollback(self) -> None:
+            session_events["rollbacks"] += 1
+            super().rollback()
+
+    client, fake_presence = make_client(session_class=TrackingSession)
+
+    def assert_released_before_upstream_call() -> None:
+        assert session_events["rollbacks"] >= 1
+
+    fake_presence.on_admin_snapshot_request = assert_released_before_upstream_call
+
+    response = client.get("/api/admin/presence/classrooms/B101/snapshot?refresh=true", headers=auth_header("ADM001"))
+
+    assert response.status_code == 200
 
 
 def test_login_sets_refresh_cookie_and_bootstraps_with_cookie_restore() -> None:

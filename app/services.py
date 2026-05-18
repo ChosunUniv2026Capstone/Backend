@@ -2406,20 +2406,26 @@ def check_attendance_eligibility(
         )
         return result
 
+    classroom_networks = [
+        {
+            "apId": network["ap_id"],
+            "ssid": network["ssid"],
+            "signalThresholdDbm": network["signal_threshold_dbm"],
+        }
+        for network in list_classroom_networks_for_classroom(db, resolved_classroom_id)
+    ]
+    # Release the read-only DB transaction before the network call to
+    # PresenceService. If PresenceService is slow or unavailable, the backend
+    # must not pin one SQLAlchemy pool connection per waiting request.
+    db.rollback()
+
     try:
         presence_payload = presence_client.check_eligibility(
             student_id=student_id,
             course_id=course_id,
             classroom_id=resolved_classroom_id,
             purpose=purpose,
-            classroom_networks=[
-                {
-                    "apId": network["ap_id"],
-                    "ssid": network["ssid"],
-                    "signalThresholdDbm": network["signal_threshold_dbm"],
-                }
-                for network in list_classroom_networks_for_classroom(db, resolved_classroom_id)
-            ],
+            classroom_networks=classroom_networks,
             registered_devices=registered_devices,
         )
     except HTTPException as exc:

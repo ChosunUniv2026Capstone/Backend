@@ -936,6 +936,33 @@ def test_professor_websocket_bootstrap_delivers_timeline() -> None:
         assert message["changed_payload"]["data"]["course_code"] == "CSE116"
 
 
+def test_attendance_websocket_releases_bootstrap_db_session_while_connected() -> None:
+    client, SessionLocal, _ = make_client()
+    session_events = {"closes": 0}
+
+    class TrackingSession(Session):
+        def close(self) -> None:
+            session_events["closes"] += 1
+            super().close()
+
+    tracking_session_factory = sessionmaker(
+        bind=SessionLocal.kw["bind"],
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        class_=TrackingSession,
+    )
+
+    from app import main as main_module
+
+    main_module.SessionLocal = tracking_session_factory
+
+    with client.websocket_connect("/ws/attendance?token=dev-token:PRF002&courseCode=CSE116&view=professor") as websocket:
+        message = websocket.receive_json()
+        assert message["event_type"] == "attendance.bootstrap"
+        assert session_events["closes"] >= 1
+
+
 def test_admin_report_websocket_bootstrap_is_allowed() -> None:
     client, _, _ = make_client()
     with client.websocket_connect("/ws/attendance?token=dev-token:ADM001&courseCode=CSE116&view=report") as websocket:

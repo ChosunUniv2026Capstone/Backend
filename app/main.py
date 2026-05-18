@@ -1816,6 +1816,10 @@ def get_admin_presence_snapshot(
     _: User = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ) -> AdminPresenceSnapshotRead:
+    # Authentication has already touched the shared request session. End that
+    # read-only transaction before waiting on PresenceService so slow AP refresh
+    # calls do not pin a DB connection from the SQLAlchemy pool.
+    db.rollback()
     snapshot_payload = presence_client.get_admin_snapshot(classroom_code=classroomCode, refresh=refresh, source=source)
     return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
 
@@ -1827,6 +1831,9 @@ def apply_admin_presence_overlay(
     _: User = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ) -> AdminPresenceSnapshotRead:
+    # Do not hold an authenticated DB connection while the upstream presence
+    # service applies the overlay.
+    db.rollback()
     snapshot_payload = presence_client.apply_admin_overlay(
         classroom_code=classroomCode,
         payload=payload.model_dump(by_alias=True),
@@ -1840,6 +1847,9 @@ def reset_admin_presence_overlay(
     _: User = Depends(require_admin_role),
     db: Session = Depends(get_db),
 ) -> AdminPresenceSnapshotRead:
+    # Do not hold an authenticated DB connection while the upstream presence
+    # service resets the overlay.
+    db.rollback()
     snapshot_payload = presence_client.reset_admin_overlay(classroom_code=classroomCode)
     return AdminPresenceSnapshotRead(**map_presence_snapshot(snapshot_payload, db))
 
@@ -2271,35 +2281,39 @@ async def attendance_websocket(
     courseCode: str = Query(...),
     view: str = Query(default="professor"),
 ) -> None:
-    db = SessionLocal()
     try:
-        if token:
-            login_id = parse_bearer_login_id(f"Bearer {token}")
-            user = get_user_by_login_id(db, login_id)
-        else:
-            raw_access_cookie = websocket.cookies.get(settings.access_cookie_name)
-            if not raw_access_cookie:
-                raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
-            identity = verify_access_token(raw_access_cookie)
-            login_id = identity.login_id
-            user = get_user_by_login_id(db, login_id)
-        validate_attendance_socket_access(db, user, courseCode, view)
+        expired_events: list[dict[str, Any]] = []
+        with SessionLocal() as db:
+            if token:
+                login_id = parse_bearer_login_id(f"Bearer {token}")
+                user = get_user_by_login_id(db, login_id)
+            else:
+                raw_access_cookie = websocket.cookies.get(settings.access_cookie_name)
+                if not raw_access_cookie:
+                    raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
+                identity = verify_access_token(raw_access_cookie)
+                login_id = identity.login_id
+                user = get_user_by_login_id(db, login_id)
+            user_role = user.role
+            professor_login_id = user.professor_id or login_id
+            validate_attendance_socket_access(db, user, courseCode, view)
+            if user_role == "student":
+                bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, courseCode)
+            elif user_role == "admin":
+                expired_events = expire_stale_attendance_sessions(db, courseCode)
+                course = get_course_by_code(db, courseCode)
+                owner = db.scalar(select(User).where(User.id == course.professor_user_id))
+                bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", courseCode)
+            else:
+                expired_events = expire_stale_attendance_sessions(db, courseCode)
+                bootstrap_data = build_attendance_timeline(db, professor_login_id, courseCode)
+            if db.in_transaction():
+                db.rollback()
         await attendance_broker.connect(
             courseCode,
             websocket,
-            {"login_id": login_id, "role": user.role, "view": view, "course_code": courseCode},
+            {"login_id": login_id, "role": user_role, "view": view, "course_code": courseCode},
         )
-        expired_events: list[dict[str, Any]] = []
-        if user.role == "student":
-            bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, courseCode)
-        elif user.role == "admin":
-            expired_events = expire_stale_attendance_sessions(db, courseCode)
-            course = get_course_by_code(db, courseCode)
-            owner = db.scalar(select(User).where(User.id == course.professor_user_id))
-            bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", courseCode)
-        else:
-            expired_events = expire_stale_attendance_sessions(db, courseCode)
-            bootstrap_data = build_attendance_timeline(db, user.professor_id or login_id, courseCode)
         await websocket.send_json(
             attendance_event_payload(
                 event_type="attendance.bootstrap",
@@ -2327,4 +2341,3 @@ async def attendance_websocket(
         pass
     finally:
         attendance_broker.disconnect(courseCode, websocket)
-        db.close()
