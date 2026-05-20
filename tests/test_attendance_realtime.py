@@ -3,6 +3,7 @@ from envelope import api_json
 
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
+import time as monotonic_time
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -945,23 +946,23 @@ def test_student_check_in_rejects_session_for_non_enrolled_course() -> None:
 
 def test_websocket_rejects_unauthorized_student_subscription() -> None:
     client, _, _ = make_client()
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws/attendance?token=dev-token:ADM001&courseCode=CSE116&view=student"):
-            pass
+    with client.websocket_connect("/ws/attendance?token=dev-token:ADM001&courseCode=CSE116&view=student") as websocket:
+        with pytest.raises(WebSocketDisconnect):
+            websocket.receive_json()
 
 
 def test_websocket_rejects_non_enrolled_student_subscription() -> None:
     client, _, _ = make_client()
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws/attendance?token=dev-token:20201239&courseCode=CSE999&view=student"):
-            pass
+    with client.websocket_connect("/ws/attendance?token=dev-token:20201239&courseCode=CSE999&view=student") as websocket:
+        with pytest.raises(WebSocketDisconnect):
+            websocket.receive_json()
 
 
 def test_websocket_rejects_wrong_professor_subscription() -> None:
     client, _, _ = make_client()
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws/attendance?token=dev-token:PRF002&courseCode=CSE999&view=professor"):
-            pass
+    with client.websocket_connect("/ws/attendance?token=dev-token:PRF002&courseCode=CSE999&view=professor") as websocket:
+        with pytest.raises(WebSocketDisconnect):
+            websocket.receive_json()
 
 
 def test_professor_websocket_bootstrap_delivers_timeline() -> None:
@@ -970,6 +971,24 @@ def test_professor_websocket_bootstrap_delivers_timeline() -> None:
         message = websocket.receive_json()
         assert message["event_type"] == "attendance.bootstrap"
         assert message["changed_payload"]["data"]["course_code"] == "CSE116"
+
+
+def test_student_websocket_accepts_before_slow_presence_bootstrap() -> None:
+    client, _, fake_presence = make_client()
+    _open_bundle_session(client, mode="smart")
+    original_check_eligibility = fake_presence.check_eligibility
+
+    def slow_check_eligibility(**kwargs):
+        monotonic_time.sleep(0.25)
+        return original_check_eligibility(**kwargs)
+
+    fake_presence.check_eligibility = slow_check_eligibility
+    started = monotonic_time.perf_counter()
+    with client.websocket_connect("/ws/attendance?token=dev-token:20201239&courseCode=CSE116&view=student") as websocket:
+        handshake_ms = (monotonic_time.perf_counter() - started) * 1000
+        assert handshake_ms < 200
+        message = websocket.receive_json()
+        assert message["event_type"] == "attendance.bootstrap"
 
 
 def test_attendance_websocket_releases_bootstrap_db_session_while_connected() -> None:

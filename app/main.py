@@ -388,6 +388,9 @@ class AttendanceRealtimeBroker:
 
     async def connect(self, course_code: str, websocket: WebSocket, meta: dict[str, Any]) -> None:
         await websocket.accept()
+        self.register(course_code, websocket, meta)
+
+    def register(self, course_code: str, websocket: WebSocket, meta: dict[str, Any]) -> None:
         self._connections[course_code].add(websocket)
         self._connection_meta[websocket] = meta
 
@@ -444,6 +447,42 @@ def _publish_expired_attendance_events_sync(expired_events: list[dict[str, Any]]
                 version=event["version"],
             ),
         )
+
+
+def _build_attendance_websocket_bootstrap(
+    *,
+    token: str | None,
+    raw_access_cookie: str | None,
+    course_code: str,
+    view: str,
+) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
+    expired_events: list[dict[str, Any]] = []
+    with SessionLocal() as db:
+        if token:
+            login_id = parse_bearer_login_id(f"Bearer {token}")
+            user = get_user_by_login_id(db, login_id)
+        else:
+            if not raw_access_cookie:
+                raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
+            identity = verify_access_token(raw_access_cookie)
+            login_id = identity.login_id
+            user = get_user_by_login_id(db, login_id)
+        user_role = user.role
+        professor_login_id = user.professor_id or login_id
+        validate_attendance_socket_access(db, user, course_code, view)
+        if user_role == "student":
+            bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, course_code)
+        elif user_role == "admin":
+            expired_events = expire_stale_attendance_sessions(db, course_code)
+            course = get_course_by_code(db, course_code)
+            owner = db.scalar(select(User).where(User.id == course.professor_user_id))
+            bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", course_code)
+        else:
+            expired_events = expire_stale_attendance_sessions(db, course_code)
+            bootstrap_data = build_attendance_timeline(db, professor_login_id, course_code)
+        if db.in_transaction():
+            db.rollback()
+    return login_id, user_role, expired_events, bootstrap_data
 
 
 def api_error(status_code: int, code: str, message: str, details: dict | None = None) -> HTTPException:
@@ -2279,35 +2318,17 @@ async def attendance_websocket(
     courseCode: str = Query(...),
     view: str = Query(default="professor"),
 ) -> None:
+    await websocket.accept()
     try:
-        expired_events: list[dict[str, Any]] = []
-        with SessionLocal() as db:
-            if token:
-                login_id = parse_bearer_login_id(f"Bearer {token}")
-                user = get_user_by_login_id(db, login_id)
-            else:
-                raw_access_cookie = websocket.cookies.get(settings.access_cookie_name)
-                if not raw_access_cookie:
-                    raise api_error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "authentication is required")
-                identity = verify_access_token(raw_access_cookie)
-                login_id = identity.login_id
-                user = get_user_by_login_id(db, login_id)
-            user_role = user.role
-            professor_login_id = user.professor_id or login_id
-            validate_attendance_socket_access(db, user, courseCode, view)
-            if user_role == "student":
-                bootstrap_data = list_student_active_attendance_sessions(db, presence_client, login_id, courseCode)
-            elif user_role == "admin":
-                expired_events = expire_stale_attendance_sessions(db, courseCode)
-                course = get_course_by_code(db, courseCode)
-                owner = db.scalar(select(User).where(User.id == course.professor_user_id))
-                bootstrap_data = build_attendance_timeline(db, owner.professor_id if owner and owner.professor_id else "", courseCode)
-            else:
-                expired_events = expire_stale_attendance_sessions(db, courseCode)
-                bootstrap_data = build_attendance_timeline(db, professor_login_id, courseCode)
-            if db.in_transaction():
-                db.rollback()
-        await attendance_broker.connect(
+        login_id, user_role, expired_events, bootstrap_data = await anyio.to_thread.run_sync(
+            lambda: _build_attendance_websocket_bootstrap(
+                token=token,
+                raw_access_cookie=websocket.cookies.get(settings.access_cookie_name),
+                course_code=courseCode,
+                view=view,
+            )
+        )
+        attendance_broker.register(
             courseCode,
             websocket,
             {"login_id": login_id, "role": user_role, "view": view, "course_code": courseCode},
