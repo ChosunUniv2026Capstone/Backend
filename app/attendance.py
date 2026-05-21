@@ -35,6 +35,16 @@ SMART_ATTENDANCE_WINDOW_MINUTES = 10
 FINAL_STATUSES = {"present", "absent", "late", "official", "sick"}
 SESSION_MODES = {"manual", "smart", "canceled"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+ATTENDANCE_CSV_STATUS_LABELS = {
+    "present": "출석",
+    "absent": "결석",
+    "late": "지각",
+    "official": "공결",
+    "sick": "공결",
+    "upcoming": "미진행",
+    "pending": "진행중",
+    "canceled": "취소",
+}
 
 
 def _utcnow() -> datetime:
@@ -1226,6 +1236,95 @@ def build_professor_student_attendance_stats(db: Session, professor_id: str, cou
     return {
         "course_code": course.course_code,
         "course_title": course.title,
+        "rows": rows,
+    }
+
+
+def _csv_status_label(status: str | None) -> str:
+    if status is None:
+        return ""
+    return ATTENDANCE_CSV_STATUS_LABELS.get(status, status)
+
+
+def _csv_slot_status(
+    session: AttendanceSession | None,
+    projection_key: str,
+    student_user_id: int,
+    record_lookup: dict[tuple[int, str, int], AttendanceRecord],
+) -> str:
+    if session is None:
+        return "upcoming"
+    if session.mode == "canceled" or session.status == "canceled":
+        return "canceled"
+    status = _resolved_slot_status(session, projection_key, student_user_id, record_lookup)
+    if status is None:
+        if session.mode == "smart" and session.status == "active":
+            return "pending"
+        return "upcoming"
+    return status
+
+
+def _csv_slot_header(slot: ProjectionSlot) -> str:
+    return (
+        f"{slot.week_index}주차 {slot.lesson_index_within_week}차시 "
+        f"{slot.session_date.strftime('%Y.%m.%d')} {slot.period_label}"
+    )
+
+
+def build_professor_attendance_csv_table(
+    db: Session,
+    professor_id: str,
+    course_code: str,
+    *,
+    variant: Literal["summary", "full"],
+) -> dict[str, Any]:
+    if variant not in {"summary", "full"}:
+        raise attendance_api_error(400, "INVALID_REPORT_EXPORT_TYPE", "invalid attendance CSV export variant", {"variant": variant})
+
+    professor, course = get_owned_course(db, professor_id, course_code)
+    expire_stale_attendance_sessions(db, course_code)
+    slots = _projection_slot_rows(db, course, professor)
+    latest_sessions, assignments_by_session = _projection_lookup_by_session(db, course.id)
+    _, record_lookup, enrolled_rows = _resolved_counts_by_session_for_course(
+        db,
+        course.id,
+        latest_sessions,
+        assignments_by_session,
+    )
+
+    headers = ["학번", "이름", "출석 차시", "결석 차시", "지각 차시", "공결 차시"]
+    if variant == "full":
+        headers.extend(_csv_slot_header(slot) for slot in slots)
+
+    rows: list[list[str | int]] = []
+    for student_user_id, student_login_id, student_name in enrolled_rows:
+        counts = _counts_template()
+        slot_statuses: list[str] = []
+        for slot in slots:
+            session = latest_sessions.get(slot.projection_key)
+            status = _csv_slot_status(session, slot.projection_key, student_user_id, record_lookup)
+            if status in FINAL_STATUSES:
+                counts[status] = counts.get(status, 0) + 1
+            if variant == "full":
+                slot_statuses.append(_csv_status_label(status))
+
+        row: list[str | int] = [
+            student_login_id,
+            student_name,
+            counts["present"],
+            counts["absent"],
+            counts["late"],
+            counts["official"] + counts["sick"],
+        ]
+        if variant == "full":
+            row.extend(slot_statuses)
+        rows.append(row)
+
+    return {
+        "course_code": course.course_code,
+        "course_title": course.title,
+        "variant": variant,
+        "headers": headers,
         "rows": rows,
     }
 
