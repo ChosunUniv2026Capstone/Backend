@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.3...v0.6.0) (2026-05-21)
+
+
+### Features
+
+* **backend:** let professors export attendance CSVs ([36e8524](https://github.com/ChosunUniv2026Capstone/Backend/commit/36e852483cf97876a12f93c0dbdf59d783c4d607))
+
+
+### Bug Fixes
+
+* **backend:** prevent presence waits from starving DB connections ([7f02a87](https://github.com/ChosunUniv2026Capstone/Backend/commit/7f02a87bea61f69d5778c63508505ff47fcd9a9b))
+
 ## [0.5.3](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.2...v0.5.3) (2026-05-18)
 
 
