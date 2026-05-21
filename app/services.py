@@ -1,7 +1,8 @@
+import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import datetime as datetime_module
-from io import BytesIO
+from io import BytesIO, StringIO
 import hashlib
 import math
 import re
@@ -12,6 +13,8 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.attendance import build_professor_attendance_csv_table
+from app.config import get_settings
 from app.models import (
     AccessPoint,
     AccessPointInterface,
@@ -41,7 +44,6 @@ from app.presence_client import (
     presence_dependency_unavailable_result,
 )
 from app.schemas import DeviceCreate
-from app.config import get_settings
 from app.storage import get_storage_backend, get_storage_backend_for_metadata, spool_limited_upload
 
 MAC_PATTERN = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
@@ -1995,7 +1997,23 @@ def list_users(db: Session) -> list[dict]:
     ]
 
 
-def create_attendance_csv_export(db: Session, *, professor_id: str, course_code: str) -> dict:
+ATTENDANCE_CSV_EXPORT_TYPES = {
+    "attendance_csv": "summary",
+    "attendance_summary_csv": "summary",
+    "attendance_full_csv": "full",
+}
+
+
+def _attendance_csv_content(headers: list[str], rows: list[list[str | int]]) -> bytes:
+    buffer = StringIO()
+    buffer.write("\ufeff")
+    writer = csv.writer(buffer)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8")
+
+
+def create_attendance_csv_export(db: Session, *, professor_id: str, course_code: str, export_type: str = "attendance_summary_csv") -> dict:
     professor = db.scalar(select(User).where(User.professor_id == professor_id, User.role == "professor"))
     course = db.scalar(select(Course).where(Course.course_code == course_code, Course.professor_user_id == getattr(professor, "id", None)))
     if professor is None or course is None:
@@ -2003,13 +2021,23 @@ def create_attendance_csv_export(db: Session, *, professor_id: str, course_code:
             status_code=404,
             detail={"code": "COURSE_NOT_FOUND", "message": "course not found", "details": {"course_code": course_code}},
         )
+    variant = ATTENDANCE_CSV_EXPORT_TYPES.get(export_type)
+    if variant is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_REPORT_EXPORT_TYPE",
+                "message": "invalid attendance report export type",
+                "details": {"export_type": export_type},
+            },
+        )
     generated_at = datetime.now(UTC)
-    filename = f"attendance-{course_code}-{generated_at.strftime('%Y%m%d%H%M%S')}.csv"
-    content = "course_code,generated_at\n" f"{course_code},{generated_at.isoformat()}\n"
+    csv_table = build_professor_attendance_csv_table(db, professor_id, course_code, variant=variant)
+    filename = f"attendance-{variant}-{course_code}-{generated_at.strftime('%Y%m%d%H%M%S')}.csv"
     written = _store_bytes_object(
-        content=content.encode("utf-8"),
+        content=_attendance_csv_content(csv_table["headers"], csv_table["rows"]),
         filename=filename,
-        mime_type="text/csv",
+        mime_type="text/csv; charset=utf-8",
         prefix=f"reports/attendance/{course_code}/{generated_at:%Y/%m}",
     )
     report = ReportExport(

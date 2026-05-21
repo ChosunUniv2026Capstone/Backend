@@ -73,6 +73,7 @@ from app.schemas import (
     AdminClassroomNetworkThresholdUpdate,
     AdminPresenceSnapshotMutationRequest,
     AdminPresenceSnapshotRead,
+    AttendanceReportExportCreate,
     AssignmentGradeRequest,
     AttendanceRecordUpdateRequest,
     AttendanceEligibilityRequest,
@@ -2091,11 +2092,13 @@ def professor_attendance_student_stats(
 def create_professor_attendance_report_export(
     professor_id: str,
     course_code: str,
+    payload: AttendanceReportExportCreate | None = None,
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
 ) -> ReportExportRead:
     require_professor_course_ownership(professor_id, course_code, current_user, db)
-    return ReportExportRead(**create_attendance_csv_export(db, professor_id=professor_id, course_code=course_code))
+    export_type = payload.export_type if payload is not None else "attendance_summary_csv"
+    return ReportExportRead(**create_attendance_csv_export(db, professor_id=professor_id, course_code=course_code, export_type=export_type))
 
 
 @app.get("/api/professors/{professor_id}/courses/{course_code}/attendance/report-exports", response_model=list[ReportExportRead])

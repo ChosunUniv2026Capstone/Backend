@@ -377,6 +377,10 @@ class ReportExportRead(StoredObjectAttachmentRead):
     generated_at: datetime | None = None
 
 
+class AttendanceReportExportCreate(BaseModel):
+    export_type: Literal["attendance_csv", "attendance_summary_csv", "attendance_full_csv"] = "attendance_summary_csv"
+
+
 class UserSummary(BaseModel):
     id: int
     role: str

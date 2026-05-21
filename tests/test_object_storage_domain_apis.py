@@ -1,8 +1,10 @@
 from __future__ import annotations
 from envelope import api_json
 
+import csv
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,35 @@ def make_client(tmp_path: Path, *, raise_server_exceptions: bool = True) -> Test
     services_module.settings.object_storage_local_dir = str(tmp_path)
     get_storage_backend.cache_clear()
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+def _csv_rows(response) -> list[list[str]]:
+    return list(csv.reader(StringIO(response.content.decode("utf-8-sig"))))
+
+
+def _seed_two_slot_attendance(client: TestClient) -> None:
+    timeline = client.get("/api/professors/PRF002/courses/CSE116/attendance/timeline", headers=auth_header("PRF002"))
+    assert timeline.status_code == 200, timeline.text
+    projection_keys = [slot["projection_key"] for slot in api_json(timeline)["weeks"][0]["slots"][:2]]
+    open_response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={"projection_keys": projection_keys, "mode": "manual"},
+    )
+    assert open_response.status_code == 200, open_response.text
+    session_id = api_json(open_response)["changed_session_ids"][0]
+    present = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "present", "projection_key": projection_keys[0]},
+    )
+    assert present.status_code == 200, present.text
+    sick = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "sick", "projection_key": projection_keys[1]},
+    )
+    assert sick.status_code == 200, sick.text
 
 
 def test_learning_item_upload_download_and_cross_role_denial(tmp_path: Path) -> None:
@@ -228,6 +259,8 @@ def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:
     assert media_download.status_code == 200
     assert media_download.content == b"png-bytes"
 
+    _seed_two_slot_attendance(client)
+
     export = client.post(
         "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
         headers=auth_header("PRF002"),
@@ -243,4 +276,89 @@ def test_notice_exam_media_and_report_exports(tmp_path: Path) -> None:
         headers=auth_header("PRF002"),
     )
     assert download.status_code == 200
-    assert b"course_code,generated_at" in download.content
+    assert download.content.startswith(b"\xef\xbb\xbf")
+    rows = _csv_rows(download)
+    assert rows[0] == ["학번", "이름", "출석 차시", "결석 차시", "지각 차시", "공결 차시"]
+    assert rows[1] == ["20201239", "Kim Student", "1", "0", "0", "1"]
+
+
+def test_attendance_summary_and_full_csv_exports(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    _seed_two_slot_attendance(client)
+
+    default_summary = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF002"),
+    )
+    assert default_summary.status_code == 201, default_summary.text
+    assert api_json(default_summary)["original_filename"].startswith("attendance-summary-CSE116-")
+
+    summary = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF002"),
+        json={"export_type": "attendance_summary_csv"},
+    )
+    assert summary.status_code == 201, summary.text
+    assert api_json(summary)["original_filename"].startswith("attendance-summary-CSE116-")
+    summary_download = client.get(
+        f"/api/professors/PRF002/courses/CSE116/attendance/report-exports/{api_json(summary)['id']}/download",
+        headers=auth_header("PRF002"),
+    )
+    assert summary_download.status_code == 200
+    summary_rows = _csv_rows(summary_download)
+    assert summary_rows == [
+        ["학번", "이름", "출석 차시", "결석 차시", "지각 차시", "공결 차시"],
+        ["20201239", "Kim Student", "1", "0", "0", "1"],
+    ]
+
+    full = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF002"),
+        json={"export_type": "attendance_full_csv"},
+    )
+    assert full.status_code == 201, full.text
+    assert api_json(full)["original_filename"].startswith("attendance-full-CSE116-")
+    full_download = client.get(
+        f"/api/professors/PRF002/courses/CSE116/attendance/report-exports/{api_json(full)['id']}/download",
+        headers=auth_header("PRF002"),
+    )
+    assert full_download.status_code == 200
+    full_rows = _csv_rows(full_download)
+    assert full_rows[0][:6] == ["학번", "이름", "출석 차시", "결석 차시", "지각 차시", "공결 차시"]
+    assert len(full_rows[0]) > 6
+    assert full_rows[1][:8] == ["20201239", "Kim Student", "1", "0", "0", "1", "출석", "공결"]
+    assert "미진행" in full_rows[1][8:]
+
+
+def test_attendance_report_export_rejects_invalid_type(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF002"),
+        json={"export_type": "attendance_pdf"},
+    )
+    assert response.status_code == 422
+
+
+def test_attendance_report_export_rejects_non_owner(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    owned = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF002"),
+        json={"export_type": "attendance_summary_csv"},
+    )
+    assert owned.status_code == 201, owned.text
+    export_id = api_json(owned)["id"]
+
+    create_denied = client.post(
+        "/api/professors/PRF003/courses/CSE116/attendance/report-exports",
+        headers=auth_header("PRF003"),
+        json={"export_type": "attendance_summary_csv"},
+    )
+    assert create_denied.status_code in {403, 404}
+
+    download_denied = client.get(
+        f"/api/professors/PRF003/courses/CSE116/attendance/report-exports/{export_id}/download",
+        headers=auth_header("PRF003"),
+    )
+    assert download_denied.status_code in {403, 404}
