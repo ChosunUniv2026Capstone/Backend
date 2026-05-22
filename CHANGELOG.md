@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.6.0...v0.7.0) (2026-05-22)
+
+
+### Features
+
+* **backend:** support explicit assignment attachment removal ([95465c1](https://github.com/ChosunUniv2026Capstone/Backend/commit/95465c1aa6241c5ea2271fb64fe9a0976c0d0136))
+
 ## [0.6.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.5.3...v0.6.0) (2026-05-21)
 
 
