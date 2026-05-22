@@ -146,6 +146,46 @@ def test_assignment_submission_replaces_old_objects_after_commit(
     assert (tmp_path / current_attachment.storage_key).read_bytes() == b"second"
 
 
+def test_assignment_submission_can_remove_existing_attachment_without_reupload(
+    db_session: Session,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = seed_assignment_context(db_session)
+    monkeypatch.setattr(assignments_module.settings, "object_storage_provider", "local")
+    monkeypatch.setattr(assignments_module.settings, "object_storage_local_dir", str(tmp_path))
+    monkeypatch.setattr(assignments_module, "_assignment_status", lambda assignment, now=None: "open")
+    get_storage_backend.cache_clear()
+
+    submit_student_assignment(
+        db_session,
+        student_user_id=ctx["student_user_id"],
+        course_id=ctx["course_id"],
+        assignment_id=ctx["assignment_id"],
+        submission_text="first",
+        files=[UploadFile(file=BytesIO(b"first"), filename="first.txt")],
+    )
+    old_attachment = db_session.scalar(select(AssignmentSubmissionAttachment))
+    assert old_attachment is not None
+    old_path = tmp_path / old_attachment.storage_key
+    assert old_path.exists()
+
+    detail = submit_student_assignment(
+        db_session,
+        student_user_id=ctx["student_user_id"],
+        course_id=ctx["course_id"],
+        assignment_id=ctx["assignment_id"],
+        submission_text="updated text only",
+        files=[],
+        remove_attachment_ids=[old_attachment.id],
+    )
+
+    assert detail["submission"]["submission_text"] == "updated text only"
+    assert detail["submission"]["attachments"] == []
+    assert db_session.get(AssignmentSubmissionAttachment, old_attachment.id) is None
+    assert not old_path.exists()
+
+
 def test_assignment_replacement_uses_deletion_outbox_when_available(
     db_session: Session,
     tmp_path,
