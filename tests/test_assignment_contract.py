@@ -104,7 +104,7 @@ def test_submission_truncates_original_filename_to_db_limit(
     assert attachment["file_size_bytes"] == 5
 
 
-def test_assignment_submission_replaces_old_objects_after_commit(
+def test_assignment_submission_appends_new_files_and_retains_existing(
     db_session: Session,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -139,14 +139,60 @@ def test_assignment_submission_replaces_old_objects_after_commit(
         files=[second],
     )
 
+    assert old_path.exists()
+    attachments = detail["submission"]["attachments"]
+    assert [attachment["original_filename"] for attachment in attachments] == ["first.txt", "second.txt"]
+    current_attachments = list(
+        db_session.scalars(
+            select(AssignmentSubmissionAttachment).order_by(AssignmentSubmissionAttachment.id.asc())
+        )
+    )
+    assert len(current_attachments) == 2
+    assert (tmp_path / current_attachments[0].storage_key).read_bytes() == b"first"
+    assert (tmp_path / current_attachments[1].storage_key).read_bytes() == b"second"
+
+
+def test_assignment_submission_can_remove_existing_attachment_without_reupload(
+    db_session: Session,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = seed_assignment_context(db_session)
+    monkeypatch.setattr(assignments_module.settings, "object_storage_provider", "local")
+    monkeypatch.setattr(assignments_module.settings, "object_storage_local_dir", str(tmp_path))
+    monkeypatch.setattr(assignments_module, "_assignment_status", lambda assignment, now=None: "open")
+    get_storage_backend.cache_clear()
+
+    submit_student_assignment(
+        db_session,
+        student_user_id=ctx["student_user_id"],
+        course_id=ctx["course_id"],
+        assignment_id=ctx["assignment_id"],
+        submission_text="first",
+        files=[UploadFile(file=BytesIO(b"first"), filename="first.txt")],
+    )
+    old_attachment = db_session.scalar(select(AssignmentSubmissionAttachment))
+    assert old_attachment is not None
+    old_path = tmp_path / old_attachment.storage_key
+    assert old_path.exists()
+
+    detail = submit_student_assignment(
+        db_session,
+        student_user_id=ctx["student_user_id"],
+        course_id=ctx["course_id"],
+        assignment_id=ctx["assignment_id"],
+        submission_text="updated text only",
+        files=[],
+        remove_attachment_ids=[old_attachment.id],
+    )
+
+    assert detail["submission"]["submission_text"] == "updated text only"
+    assert detail["submission"]["attachments"] == []
+    assert db_session.get(AssignmentSubmissionAttachment, old_attachment.id) is None
     assert not old_path.exists()
-    [attachment] = detail["submission"]["attachments"]
-    current_attachment = db_session.get(AssignmentSubmissionAttachment, attachment["id"])
-    assert current_attachment is not None
-    assert (tmp_path / current_attachment.storage_key).read_bytes() == b"second"
 
 
-def test_assignment_replacement_uses_deletion_outbox_when_available(
+def test_assignment_removal_uses_deletion_outbox_when_available(
     db_session: Session,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -185,22 +231,25 @@ def test_assignment_replacement_uses_deletion_outbox_when_available(
     old_attachment = db_session.scalar(select(AssignmentSubmissionAttachment))
     assert old_attachment is not None
     old_path = tmp_path / old_attachment.storage_key
+    assert old_path.exists()
 
     submit_student_assignment(
         db_session,
         student_user_id=ctx["student_user_id"],
         course_id=ctx["course_id"],
         assignment_id=ctx["assignment_id"],
-        submission_text="second",
-        files=[UploadFile(file=BytesIO(b"second"), filename="second.txt")],
+        submission_text="second text only",
+        files=[],
+        remove_attachment_ids=[old_attachment.id],
     )
 
     queued = db_session.execute(
-        text("SELECT storage_provider, bucket_name, storage_key, status FROM object_deletion_jobs")
+        text("SELECT storage_provider, bucket_name, storage_key, reason, status FROM object_deletion_jobs")
     ).mappings().one()
     assert queued["storage_provider"] == "local"
     assert queued["bucket_name"] == "local"
     assert queued["storage_key"] == old_attachment.storage_key
+    assert queued["reason"] == "assignment_attachment_removed"
     assert queued["status"] == "completed"
     assert not old_path.exists()
 

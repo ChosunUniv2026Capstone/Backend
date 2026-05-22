@@ -1144,6 +1144,7 @@ def submit_student_course_assignment(
     course_code: str,
     assignment_id: int,
     submission_text: str | None = Form(default=None),
+    remove_attachment_ids: list[int] = Form(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
     current_user: User = Depends(require_authenticated_user),
     db: Session = Depends(get_db),
@@ -1157,6 +1158,7 @@ def submit_student_course_assignment(
             assignment_id=assignment_id,
             submission_text=submission_text,
             files=files,
+            remove_attachment_ids=remove_attachment_ids,
         )
     )
 

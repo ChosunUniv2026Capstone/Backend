@@ -474,6 +474,7 @@ def submit_student_assignment(
     assignment_id: int,
     submission_text: str | None,
     files: list[UploadFile],
+    remove_attachment_ids: list[int] | None = None,
 ) -> dict:
     assignment = _load_assignment(db, course_id=course_id, assignment_id=assignment_id)
     if _assignment_status(assignment) != "open":
@@ -520,8 +521,40 @@ def submit_student_assignment(
             .order_by(AssignmentSubmissionAttachment.id.asc())
         )
     )
+    existing_attachment_index = {attachment.id: attachment for attachment in existing_attachments}
+    normalized_remove_ids: list[int] = []
+    seen_remove_ids: set[int] = set()
+    for attachment_id in remove_attachment_ids or []:
+        if attachment_id in seen_remove_ids:
+            continue
+        attachment = existing_attachment_index.get(attachment_id)
+        if attachment is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "ASSIGNMENT_INVALID_PAYLOAD",
+                    "message": "invalid attachment removal request",
+                    "details": {"field": "remove_attachment_ids", "attachment_id": attachment_id},
+                },
+            )
+        seen_remove_ids.add(attachment_id)
+        normalized_remove_ids.append(attachment_id)
 
-    if not normalized_text and not normalized_files and not existing_attachments:
+    retained_attachments = [
+        attachment for attachment in existing_attachments if attachment.id not in seen_remove_ids
+    ]
+    final_attachment_count = len(retained_attachments) + len(normalized_files)
+    if final_attachment_count > settings.assignment_upload_max_files:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ASSIGNMENT_SUBMISSION_FILE_LIMIT_EXCEEDED",
+                "message": "too many assignment submission files",
+                "details": {"max_files": settings.assignment_upload_max_files},
+            },
+        )
+
+    if not normalized_text and final_attachment_count == 0:
         raise HTTPException(
             status_code=400,
             detail={
@@ -546,12 +579,12 @@ def submit_student_assignment(
         submission.submission_text = normalized_text
         submission.submitted_at = datetime.now(UTC)
 
-        if normalized_files:
-            for existing in existing_attachments:
-                db.delete(existing)
-
+        if normalized_remove_ids:
+            for attachment_id in normalized_remove_ids:
+                db.delete(existing_attachment_index[attachment_id])
             db.flush()
 
+        if normalized_files:
             for written in written_files:
                 db.add(
                     AssignmentSubmissionAttachment(
@@ -577,10 +610,14 @@ def submit_student_assignment(
             )
         raise
 
-    if normalized_files:
+    if normalized_remove_ids:
         enqueued_deletions = False
-        for existing in existing_attachments:
-            enqueued_deletions = _delete_or_enqueue_object(db, existing, reason="assignment_attachment_replaced") or enqueued_deletions
+        for attachment_id in normalized_remove_ids:
+            enqueued_deletions = _delete_or_enqueue_object(
+                db,
+                existing_attachment_index[attachment_id],
+                reason="assignment_attachment_removed",
+            ) or enqueued_deletions
         if enqueued_deletions:
             process_object_deletion_jobs(db)
 

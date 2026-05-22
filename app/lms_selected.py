@@ -259,6 +259,8 @@ def answer_qna_thread(db: Session, *, course: Course, professor: User, thread_id
     thread = db.scalar(select(CourseQnaThread).where(CourseQnaThread.id == thread_id, CourseQnaThread.course_id == course.id))
     if thread is None:
         raise _api_error(404, "QNA_THREAD_NOT_FOUND", "qna thread not found", {"thread_id": thread_id})
+    if thread.status == "closed":
+        raise _api_error(400, "QNA_THREAD_CLOSED", "closed qna thread cannot accept more answers", {"thread_id": thread_id})
     thread.status = "closed" if close else "answered"
     thread.updated_at = _utcnow()
     db.add(CourseQnaPost(thread_id=thread.id, author_user_id=professor.id, body=normalized_body, post_type="answer"))

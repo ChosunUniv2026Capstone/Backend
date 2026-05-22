@@ -308,6 +308,40 @@ def test_qna_validation_and_thread_update_status() -> None:
     assert api_json(answered)["status"] == "answered"
 
 
+def test_qna_closed_thread_rejects_additional_answer() -> None:
+    client, _ = make_client()
+
+    created = client.post(
+        "/api/students/20201239/courses/CSE116/qna",
+        headers=auth_header("20201239"),
+        json={"title": "Can I revise?", "body": "Can I resubmit the report?"},
+    )
+    payload = api_json(created)
+
+    closed = client.post(
+        f"/api/professors/PRF002/courses/CSE116/qna/{payload['id']}/answer",
+        headers=auth_header("PRF002"),
+        json={"body": "No, the deadline has passed.", "close": True},
+    )
+    assert closed.status_code == 201
+    assert api_json(closed)["status"] == "closed"
+
+    repeated = client.post(
+        f"/api/professors/PRF002/courses/CSE116/qna/{payload['id']}/answer",
+        headers=auth_header("PRF002"),
+        json={"body": "One more answer.", "close": False},
+    )
+    assert repeated.status_code == 400
+    assert repeated.json()["error"]["code"] == "QNA_THREAD_CLOSED"
+
+    listed = client.get("/api/professors/PRF002/courses/CSE116/qna", headers=auth_header("PRF002"))
+    [thread] = [item for item in api_json(listed) if item["id"] == payload["id"]]
+    assert [post["body"] for post in thread["posts"]] == [
+        "Can I resubmit the report?",
+        "No, the deadline has passed.",
+    ]
+
+
 def test_learning_progress_requires_valid_inputs_and_active_items_only() -> None:
     client, session_factory = make_client()
 
