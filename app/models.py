@@ -484,11 +484,9 @@ class AttendanceSessionSlot(Base):
 
 class AttendanceMonitoringLease(Base):
     __tablename__ = "attendance_monitoring_leases"
-    __table_args__ = (UniqueConstraint("attendance_session_id"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
-    owner_instance_id: Mapped[str] = mapped_column(String(120))
+    attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), primary_key=True)
+    owner_instance_id: Mapped[str] = mapped_column("lease_owner", String(120))
     lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -507,11 +505,13 @@ class AttendanceMonitoringState(Base):
     attendance_session_id: Mapped[int] = mapped_column(ForeignKey("attendance_sessions.id"), index=True)
     projection_key: Mapped[str] = mapped_column(String(255), index=True)
     student_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    slot_start_at: Mapped[time] = mapped_column(Time)
+    slot_end_at: Mapped[time] = mapped_column(Time)
     last_accounted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     away_seconds: Mapped[int] = mapped_column(Integer, default=0)
     unknown_seconds_consumed: Mapped[int] = mapped_column(Integer, default=0)
     current_presence_state: Mapped[str] = mapped_column(String(32), default="outside_time")
-    last_presence_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_presence_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status_candidate: Mapped[str] = mapped_column(String(16), default="present")
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

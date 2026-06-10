@@ -7,8 +7,10 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from sqlalchemy import Select, desc, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session
 
+from app.config import default_attendance_monitoring_instance_id
 from app.models import (
     AttendanceMonitoringLease,
     AttendanceMonitoringState,
@@ -193,19 +195,22 @@ def _projection_slot_rows(db: Session, course: Course, professor: User) -> list[
 
             start_dt = datetime.combine(cursor, starts_at)
             end_dt = datetime.combine(cursor, ends_at)
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
             period_index = 1
             while start_dt + timedelta(minutes=30) <= end_dt:
                 slot_end_dt = start_dt + timedelta(minutes=30)
-                projection_key = create_projection_key(course.course_code, classroom_code, cursor, start_dt.time(), slot_end_dt.time())
+                slot_session_date = start_dt.date()
+                projection_key = create_projection_key(course.course_code, classroom_code, slot_session_date, start_dt.time(), slot_end_dt.time())
                 raw_slots.append(
                     {
                         "projection_key": projection_key,
                         "course_code": course.course_code,
                         "classroom_code": classroom_code,
-                        "session_date": cursor,
+                        "session_date": slot_session_date,
                         "slot_start_at": start_dt.time().replace(microsecond=0),
                         "slot_end_at": slot_end_dt.time().replace(microsecond=0),
-                        "week_start": cursor - timedelta(days=cursor.weekday()),
+                        "week_start": slot_session_date - timedelta(days=slot_session_date.weekday()),
                         "period_index_within_day": period_index,
                     }
                 )
@@ -280,7 +285,11 @@ def _slot_start_dt(assignment: SessionSlotAssignment) -> datetime:
 
 
 def _slot_end_dt(assignment: SessionSlotAssignment) -> datetime:
-    return datetime.combine(assignment.session_date, assignment.slot_end_at, tzinfo=UTC)
+    slot_start = _slot_start_dt(assignment)
+    slot_end = datetime.combine(assignment.session_date, assignment.slot_end_at, tzinfo=UTC)
+    if slot_end <= slot_start:
+        slot_end += timedelta(days=1)
+    return slot_end
 
 
 def _session_continuous_expires_at(assignments: list[SessionSlotAssignment]) -> datetime:
@@ -367,8 +376,9 @@ def _assignment_from_projection_slot(classroom_id: int, slot: ProjectionSlot, *,
 
 
 def _bundle_bounds(assignments: list[SessionSlotAssignment]) -> tuple[time, time]:
-    ordered = sorted(assignments, key=lambda item: (item.slot_start_at, item.slot_order))
-    return ordered[0].slot_start_at, max(item.slot_end_at for item in ordered)
+    ordered_by_start = sorted(assignments, key=lambda item: (_slot_start_dt(item), item.slot_order))
+    final_assignment = max(assignments, key=_slot_end_dt)
+    return ordered_by_start[0].slot_start_at, final_assignment.slot_end_at
 
 
 def _projection_lookup_by_session(
@@ -1131,6 +1141,35 @@ def _continuous_panel_color(state: AttendanceMonitoringState | None, *, now: dat
     return "red"
 
 
+def _continuous_panel_payload(
+    state: AttendanceMonitoringState | None,
+    *,
+    now: datetime,
+    assignment: SessionSlotAssignment,
+) -> dict[str, Any]:
+    return {
+        **_continuous_state_payload(state),
+        "panel_color": _continuous_panel_color(
+            state,
+            now=now,
+            assignment=assignment,
+        ),
+    }
+
+
+def _continuous_display_assignment(assignments: list[SessionSlotAssignment], *, now: datetime) -> SessionSlotAssignment:
+    return next(
+        (assignment for assignment in assignments if _slot_start_dt(assignment) <= now < _slot_end_dt(assignment)),
+        assignments[0],
+    )
+
+
+def _continuous_roster_summary(slot_states: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not slot_states:
+        return _continuous_state_payload(None)
+    return max(slot_states.values(), key=lambda payload: int(payload.get("away_seconds") or 0))
+
+
 def _ensure_monitoring_state(
     db: Session,
     *,
@@ -1151,6 +1190,8 @@ def _ensure_monitoring_state(
         attendance_session_id=session.id,
         projection_key=assignment.projection_key,
         student_user_id=student_user_id,
+        slot_start_at=assignment.slot_start_at,
+        slot_end_at=assignment.slot_end_at,
         last_accounted_until=None,
         away_seconds=0,
         unknown_seconds_consumed=0,
@@ -1171,10 +1212,36 @@ def _acquire_monitoring_lease(
     now: datetime,
     lease_seconds: int,
 ) -> bool:
-    lease = db.scalar(
-        select(AttendanceMonitoringLease).where(AttendanceMonitoringLease.attendance_session_id == session.id)
-    )
     lease_until = now + timedelta(seconds=lease_seconds)
+    if db.get_bind().dialect.name == "postgresql":
+        table = AttendanceMonitoringLease.__table__
+        statement = (
+            postgres_insert(table)
+            .values(
+                attendance_session_id=session.id,
+                lease_owner=instance_id,
+                lease_until=lease_until,
+                heartbeat_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[table.c.attendance_session_id],
+                set_={
+                    "lease_owner": instance_id,
+                    "lease_until": lease_until,
+                    "heartbeat_at": now,
+                    "updated_at": func.now(),
+                },
+                where=or_(table.c.lease_until <= now, table.c.lease_owner == instance_id),
+            )
+            .returning(table.c.attendance_session_id)
+        )
+        return db.execute(statement).first() is not None
+
+    lease = db.scalar(
+        select(AttendanceMonitoringLease)
+        .where(AttendanceMonitoringLease.attendance_session_id == session.id)
+        .with_for_update()
+    )
     if lease is not None:
         current_lease_until = _coerce_utc(lease.lease_until)
         if current_lease_until and current_lease_until > now and lease.owner_instance_id != instance_id:
@@ -1210,6 +1277,7 @@ def _account_continuous_state(
         return None
 
     account_until = min(now, slot_end)
+    had_previous_accounting = state.last_accounted_until is not None
     previous_accounted_until = _coerce_utc(state.last_accounted_until) or slot_start
     if previous_accounted_until < slot_start:
         previous_accounted_until = slot_start
@@ -1220,6 +1288,8 @@ def _account_continuous_state(
     reason_code = str(eligibility.get("reason_code") or "UNKNOWN")
     previous_candidate = state.status_candidate
     if eligibility.get("eligible"):
+        if not had_previous_accounting:
+            state.away_seconds = int(state.away_seconds or 0) + delta_seconds
         state.current_presence_state = "present"
     elif reason_code in CONTINUOUS_DEPENDENCY_UNKNOWN_REASONS:
         remaining_unknown = max(0, CONTINUOUS_UNKNOWN_GRACE_SECONDS - int(state.unknown_seconds_consumed or 0))
@@ -1272,7 +1342,7 @@ def tick_continuous_attendance_sessions(
     db: Session,
     presence_client: PresenceClient,
     *,
-    instance_id: str = "backend-local",
+    instance_id: str | None = None,
     now: datetime | None = None,
     lease_seconds: int = 30,
     course_code: str | None = None,
@@ -1280,6 +1350,7 @@ def tick_continuous_attendance_sessions(
     """Run one lease-protected continuous attendance tick."""
 
     tick_now = _coerce_utc(now) or _utcnow()
+    effective_instance_id = instance_id or default_attendance_monitoring_instance_id()
     query: Select[tuple[AttendanceSession, Course]] = (
         select(AttendanceSession, Course)
         .join(Course, Course.id == AttendanceSession.course_id)
@@ -1298,15 +1369,18 @@ def tick_continuous_attendance_sessions(
         if not _acquire_monitoring_lease(
             db,
             session=session,
-            instance_id=instance_id,
+            instance_id=effective_instance_id,
             now=tick_now,
             lease_seconds=lease_seconds,
         ):
             continue
+        db.commit()
         assignments = _session_assignments_for_one(db, session)
         enrolled_rows = _enrolled_students_for_course(db, session.course_id)
         changed_projection_keys: set[str] = set()
         pending_audits: list[tuple[SessionSlotAssignment, int, str | None, str]] = []
+        eligibility_results: list[tuple[SessionSlotAssignment, int, dict[str, Any]]] = []
+        lease_lost = False
         for assignment in assignments:
             if tick_now <= _slot_start_dt(assignment):
                 continue
@@ -1314,12 +1388,16 @@ def tick_continuous_attendance_sessions(
                 student = db.get(User, student_user_id)
                 if student is None:
                     continue
-                state = _ensure_monitoring_state(
+                if not _acquire_monitoring_lease(
                     db,
                     session=session,
-                    assignment=assignment,
-                    student_user_id=student_user_id,
-                )
+                    instance_id=effective_instance_id,
+                    now=_utcnow(),
+                    lease_seconds=lease_seconds,
+                ):
+                    lease_lost = True
+                    break
+                db.commit()
                 eligibility = _presence_eligibility_for_assignment(
                     db,
                     presence_client,
@@ -1328,23 +1406,35 @@ def tick_continuous_attendance_sessions(
                     assignment,
                     _registered_devices_payload(db, student),
                     persist_log=False,
-                    release_connection_before_check=False,
+                    release_connection_before_check=True,
                 )
-                previous_candidate = _account_continuous_state(
-                    state,
-                    assignment=assignment,
-                    eligibility=eligibility,
-                    now=tick_now,
-                )
-                if previous_candidate is not None:
-                    changed_projection_keys.add(assignment.projection_key)
-                    if previous_candidate == "present" and state.status_candidate == "absent":
-                        pending_audits.append((assignment, student_user_id, "present", "late"))
-                        pending_audits.append((assignment, student_user_id, "late", "absent"))
-                    else:
-                        pending_audits.append(
-                            (assignment, student_user_id, previous_candidate, state.status_candidate)
-                        )
+                eligibility_results.append((assignment, student_user_id, eligibility))
+            if lease_lost:
+                break
+        if lease_lost:
+            continue
+        for assignment, student_user_id, eligibility in eligibility_results:
+            state = _ensure_monitoring_state(
+                db,
+                session=session,
+                assignment=assignment,
+                student_user_id=student_user_id,
+            )
+            previous_candidate = _account_continuous_state(
+                state,
+                assignment=assignment,
+                eligibility=eligibility,
+                now=tick_now,
+            )
+            if previous_candidate is not None:
+                changed_projection_keys.add(assignment.projection_key)
+                if previous_candidate == "present" and state.status_candidate == "absent":
+                    pending_audits.append((assignment, student_user_id, "present", "late"))
+                    pending_audits.append((assignment, student_user_id, "late", "absent"))
+                else:
+                    pending_audits.append(
+                        (assignment, student_user_id, previous_candidate, state.status_candidate)
+                    )
         if pending_audits:
             session.latest_version += 1
             for assignment, student_user_id, previous_status, new_status in pending_audits:
@@ -1367,6 +1457,34 @@ def tick_continuous_attendance_sessions(
                     "session_id": session.id,
                     "version": session.latest_version,
                     "event_type": "attendance.continuous.updated",
+                    "occurred_at": _serialize_dt(tick_now),
+                }
+            )
+        expires_at = _coerce_utc(session.expires_at)
+        session_due = expires_at is not None and expires_at <= tick_now
+        assignments_due = bool(assignments) and all(_slot_end_dt(assignment) <= tick_now for assignment in assignments)
+        if session_due or assignments_due:
+            session.latest_version += 1
+            _materialize_continuous_session_records(
+                db,
+                session,
+                actor_user_id=session.opened_by_user_id,
+                actor_role="system",
+                change_source="continuous-monitoring-expire",
+                version=session.latest_version,
+                changed_at=tick_now,
+            )
+            session.status = "expired"
+            session.closed_at = tick_now
+            session.expires_at = None
+            events.append(
+                {
+                    "course_code": course.course_code,
+                    "projection_key": session.projection_key,
+                    "projection_keys": [assignment.projection_key for assignment in assignments],
+                    "session_id": session.id,
+                    "version": session.latest_version,
+                    "event_type": "session.expired",
                     "occurred_at": _serialize_dt(tick_now),
                 }
             )
@@ -1482,7 +1600,7 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
             )
             for assignment in assignments
         }
-        max_away_seconds = max((slot_state["away_seconds"] for slot_state in continuous_slots.values()), default=0)
+        continuous_summary = _continuous_roster_summary(continuous_slots)
         students.append(
             {
                 "student_id": student_login_id,
@@ -1495,9 +1613,15 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
                 "attendance_reason": anchor_record.attendance_reason if anchor_record else None,
                 "history_count": history_counts.get(student_user_id, 0),
                 "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
+                "away_seconds": continuous_summary["away_seconds"] if _is_continuous_session(session) else None,
+                "away_minutes": continuous_summary["away_minutes"] if _is_continuous_session(session) else None,
+                "current_presence_state": continuous_summary["current_presence_state"] if _is_continuous_session(session) else None,
+                "last_presence_reason": continuous_summary["last_presence_reason"] if _is_continuous_session(session) else None,
+                "status_candidate": continuous_summary["status_candidate"] if _is_continuous_session(session) else None,
+                "monitoring_state": continuous_summary if _is_continuous_session(session) else None,
                 "continuous_presence": {
-                    "away_seconds": max_away_seconds,
-                    "away_minutes": max_away_seconds // 60,
+                    "away_seconds": continuous_summary["away_seconds"],
+                    "away_minutes": continuous_summary["away_minutes"],
                     "slots": continuous_slots,
                 } if _is_continuous_session(session) else None,
             }
@@ -1573,7 +1697,12 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
                     "history_count": history_counts.get(student_user_id, 0),
                     "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
                     "continuous_presence": continuous_payload if _is_continuous_session(latest_session) else None,
+                    "monitoring_state": continuous_payload if _is_continuous_session(latest_session) else None,
+                    "away_seconds": continuous_payload["away_seconds"] if _is_continuous_session(latest_session) else None,
                     "away_minutes": continuous_payload["away_minutes"] if _is_continuous_session(latest_session) else None,
+                    "current_presence_state": continuous_payload["current_presence_state"] if _is_continuous_session(latest_session) else None,
+                    "last_presence_reason": continuous_payload["last_presence_reason"] if _is_continuous_session(latest_session) else None,
+                    "status_candidate": continuous_payload["status_candidate"] if _is_continuous_session(latest_session) else None,
                 }
             )
         aggregate = resolved_counts.get(projection_key, _counts_template())
@@ -2152,18 +2281,21 @@ def list_student_active_attendance_sessions(
         assignments = assignments_by_session.get(session.id, [_fallback_session_assignment(session)])
         if _is_continuous_session(session):
             state_lookup = _monitoring_state_lookup(db, session.id)
+            display_assignment = _continuous_display_assignment(assignments, now=now)
+            display_payload = _continuous_panel_payload(
+                state_lookup.get((student.id, display_assignment.projection_key)),
+                now=now,
+                assignment=display_assignment,
+            )
             eligibilities = [
                 {
                     "projection_key": assignment.projection_key,
                     "eligibility": None,
-                    "continuous_presence": {
-                        **_continuous_state_payload(state_lookup.get((student.id, assignment.projection_key))),
-                        "panel_color": _continuous_panel_color(
-                            state_lookup.get((student.id, assignment.projection_key)),
-                            now=now,
-                            assignment=assignment,
-                        ),
-                    },
+                    "continuous_presence": _continuous_panel_payload(
+                        state_lookup.get((student.id, assignment.projection_key)),
+                        now=now,
+                        assignment=assignment,
+                    ),
                 }
                 for assignment in assignments
             ]
@@ -2199,6 +2331,14 @@ def list_student_active_attendance_sessions(
                 "attendance_policy": _session_policy(session),
                 "can_check_in": False if _is_continuous_session(session) else bool(changed_or_present),
                 "check_in_policy": "disabled_continuous_presence" if _is_continuous_session(session) else "smart_window_self_check_in",
+                "panel_color": display_payload["panel_color"] if _is_continuous_session(session) else None,
+                "status_panel_color": display_payload["panel_color"] if _is_continuous_session(session) else None,
+                "current_presence_state": display_payload["current_presence_state"] if _is_continuous_session(session) else None,
+                "away_seconds": display_payload["away_seconds"] if _is_continuous_session(session) else None,
+                "away_minutes": display_payload["away_minutes"] if _is_continuous_session(session) else None,
+                "last_presence_reason": display_payload["last_presence_reason"] if _is_continuous_session(session) else None,
+                "status_candidate": display_payload["status_candidate"] if _is_continuous_session(session) else None,
+                "monitoring_state": display_payload if _is_continuous_session(session) else None,
                 "eligibility": {
                     "eligible_slot_count": len(changed_or_present),
                     "rejected_slot_count": len(eligibilities) - len(changed_or_present),
