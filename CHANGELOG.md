@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.7.0...v0.8.0) (2026-06-10)
+
+
+### Features
+
+* **backend:** enable continuous automatic attendance ([47e6141](https://github.com/ChosunUniv2026Capstone/Backend/commit/47e61413bb055077e864e95a7381b0d1566b4b9a))
+
 ## [0.7.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.6.0...v0.7.0) (2026-05-22)
 
 
