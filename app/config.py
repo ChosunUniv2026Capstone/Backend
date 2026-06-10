@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 1800
     db_pool_pre_ping: bool = True
     presence_service_url: str = "http://presence-service:8001"
+    attendance_monitoring_worker_enabled: bool = True
+    attendance_monitoring_worker_interval_seconds: float = 10.0
+    attendance_monitoring_lease_seconds: int = 30
+    attendance_monitoring_instance_id: str = "backend-local"
     assignment_upload_dir: str = "storage/assignments"
     object_storage_provider: str = "local"
     object_storage_local_dir: str = "storage/objects"

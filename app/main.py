@@ -1,6 +1,9 @@
 from collections import defaultdict
 from datetime import UTC, datetime
+import asyncio
+import contextlib
 import json
+import logging
 from typing import Any
 from urllib.parse import quote
 
@@ -54,6 +57,7 @@ from app.attendance import (
     open_attendance_sessions_batch,
     ensure_student_enrolled,
     student_attendance_check_in,
+    tick_continuous_attendance_sessions,
     update_attendance_session_record,
 )
 from app.models import Course, CourseEnrollment, RegisteredDevice, User
@@ -165,6 +169,17 @@ from app.services import (
 
 settings = get_settings()
 presence_client = PresenceClient(settings.presence_service_url)
+logger = logging.getLogger(__name__)
+attendance_monitoring_task: asyncio.Task[None] | None = None
+
+
+@contextlib.asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    await _start_continuous_attendance_monitoring_worker()
+    try:
+        yield
+    finally:
+        await _stop_continuous_attendance_monitoring_worker()
 
 
 def _download_content_disposition(filename: str) -> str:
@@ -223,7 +238,7 @@ def _cors_origins() -> list[str]:
     return [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Backend", version="0.1.0")
+app = FastAPI(title="Backend", version="0.1.0", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
@@ -448,6 +463,52 @@ def _publish_expired_attendance_events_sync(expired_events: list[dict[str, Any]]
                 version=event["version"],
             ),
         )
+
+
+async def _continuous_attendance_monitoring_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.attendance_monitoring_worker_interval_seconds)
+        try:
+            with SessionLocal() as db:
+                events = tick_continuous_attendance_sessions(
+                    db,
+                    presence_client,
+                    instance_id=settings.attendance_monitoring_instance_id,
+                    lease_seconds=settings.attendance_monitoring_lease_seconds,
+                )
+            for event in events:
+                await attendance_broker.publish(
+                    event["course_code"],
+                    attendance_event_payload(
+                        event_type=event["event_type"],
+                        course_code=event["course_code"],
+                        projection_keys=event.get("projection_keys", [event["projection_key"]]),
+                        session_ids=[event["session_id"]],
+                        version=event["version"],
+                    ),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("continuous attendance monitoring tick failed")
+
+
+async def _start_continuous_attendance_monitoring_worker() -> None:
+    global attendance_monitoring_task
+    if not settings.attendance_monitoring_worker_enabled:
+        return
+    if attendance_monitoring_task is None or attendance_monitoring_task.done():
+        attendance_monitoring_task = asyncio.create_task(_continuous_attendance_monitoring_loop())
+
+
+async def _stop_continuous_attendance_monitoring_worker() -> None:
+    global attendance_monitoring_task
+    if attendance_monitoring_task is None:
+        return
+    attendance_monitoring_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await attendance_monitoring_task
+    attendance_monitoring_task = None
 
 
 def _build_attendance_websocket_bootstrap(
@@ -2142,6 +2203,7 @@ def professor_open_attendance_sessions_batch(
         course_code,
         projection_keys=payload.projection_keys,
         mode=payload.mode,
+        attendance_policy=payload.attendance_policy,
     )
     _release_db_connection(db)
     _publish_attendance_sync(
@@ -2151,7 +2213,11 @@ def professor_open_attendance_sessions_batch(
             course_code=course_code,
             projection_keys=result["changed_projection_keys"],
             session_ids=result["changed_session_ids"],
-            changed_payload={"results": result["results"], "mode": payload.mode},
+            changed_payload={
+                "results": result["results"],
+                "mode": payload.mode,
+                "attendance_policy": result.get("attendance_policy"),
+            },
         ),
     )
     return result
