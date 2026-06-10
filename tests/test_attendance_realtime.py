@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import get_db
 from app.main import app
-from app.attendance import tick_continuous_attendance_sessions
+from app.attendance import expire_stale_attendance_sessions, tick_continuous_attendance_sessions
 from app.models import (
     AttendanceMonitoringLease,
     AttendanceMonitoringState,
@@ -1007,6 +1007,108 @@ def test_continuous_tick_auto_expires_and_materializes_records_after_session_end
         )
         assert final_audit is not None
         assert final_audit.new_status == "absent"
+
+
+def test_continuous_expiry_preserves_professor_manual_override() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=20, ends_in_minutes=-1)
+
+    override = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "official", "reason": "교수 인정 출석", "projection_key": projection_key},
+    )
+    assert override.status_code == 200
+
+    with SessionLocal() as db:
+        events = tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    assert [event["event_type"] for event in events] == ["attendance.continuous.updated", "session.expired"]
+    with SessionLocal() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "official"
+        assert record.attendance_reason == "교수 인정 출석"
+        auto_final_audit = db.scalar(
+            select(AttendanceStatusAuditLog)
+            .where(
+                AttendanceStatusAuditLog.attendance_session_id == session_id,
+                AttendanceStatusAuditLog.projection_key == projection_key,
+                AttendanceStatusAuditLog.student_user_id == student.id,
+                AttendanceStatusAuditLog.change_source == "continuous-monitoring-expire",
+            )
+            .order_by(AttendanceStatusAuditLog.id.desc())
+        )
+        assert auto_final_audit is None
+
+
+def test_stale_continuous_expiry_catches_up_unaccounted_time() -> None:
+    client, SessionLocal, _ = make_client()
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=20, ends_in_minutes=-1)
+    slot_start = tick_now - timedelta(minutes=20)
+    slot_end = tick_now - timedelta(minutes=1)
+
+    with SessionLocal.begin() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        db.add(
+            AttendanceMonitoringState(
+                attendance_session_id=session_id,
+                projection_key=projection_key,
+                student_user_id=student.id,
+                slot_start_at=slot_start.time().replace(microsecond=0),
+                slot_end_at=slot_end.time().replace(microsecond=0),
+                last_accounted_until=slot_start + timedelta(seconds=60),
+                away_seconds=0,
+                unknown_seconds_consumed=60,
+                current_presence_state="unknown",
+                last_presence_reason="AP_OFFLINE",
+                status_candidate="present",
+            )
+        )
+
+    with SessionLocal() as db:
+        events = expire_stale_attendance_sessions(db, course_code="CSE116")
+
+    assert [event["event_type"] for event in events] == ["session.expired"]
+    with SessionLocal() as db:
+        session = db.get(AttendanceSession, session_id)
+        assert session is not None
+        assert session.status == "expired"
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        state = db.scalar(
+            select(AttendanceMonitoringState).where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+                AttendanceMonitoringState.student_user_id == student.id,
+            )
+        )
+        assert state is not None
+        assert state.away_seconds >= 18 * 60
+        assert state.status_candidate == "absent"
+        assert state.finalized_at is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "absent"
+        assert record.attendance_reason == "강의실 이탈로 인한 결석"
 
 
 def test_continuous_monitoring_models_match_db_contract() -> None:

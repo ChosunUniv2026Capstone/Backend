@@ -51,6 +51,13 @@ CONTINUOUS_DEPENDENCY_UNKNOWN_REASONS = {
     "PRESENCE_SERVICE_UNAVAILABLE",
     "COLLECTOR_REGISTRY_UNAVAILABLE",
 }
+PROFESSOR_ATTENDANCE_CHANGE_SOURCES = {"professor-manual", "professor-slot-exception"}
+ATTENDANCE_RECORD_CHANGE_SOURCES = PROFESSOR_ATTENDANCE_CHANGE_SOURCES | {
+    "self-checkin",
+    "smart-close-default",
+    "smart-expire-default",
+    "continuous-monitoring-expire",
+}
 FINAL_STATUSES = {"present", "absent", "late", "official", "sick"}
 SESSION_MODES = {"manual", "smart", "canceled"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -510,6 +517,7 @@ def _materialize_smart_session_absences(
     if session.mode != "smart":
         return
     if _is_continuous_session(session):
+        _catch_up_continuous_monitoring_states(db, session, now=changed_at)
         _materialize_continuous_session_records(
             db,
             session,
@@ -1117,6 +1125,53 @@ def _monitoring_state_lookup(db: Session, session_id: int) -> dict[tuple[int, st
     return {(row.student_user_id, row.projection_key): row for row in rows}
 
 
+def _latest_attendance_audit_lookup(db: Session, session_id: int) -> dict[tuple[int, str], AttendanceStatusAuditLog]:
+    rows = db.scalars(
+        select(AttendanceStatusAuditLog)
+        .where(
+            AttendanceStatusAuditLog.attendance_session_id == session_id,
+            AttendanceStatusAuditLog.change_source.in_(ATTENDANCE_RECORD_CHANGE_SOURCES),
+        )
+        .order_by(desc(AttendanceStatusAuditLog.changed_at), desc(AttendanceStatusAuditLog.id))
+    ).all()
+    lookup: dict[tuple[int, str], AttendanceStatusAuditLog] = {}
+    for row in rows:
+        key = (row.student_user_id, row.projection_key)
+        if key not in lookup:
+            lookup[key] = row
+    return lookup
+
+
+def _is_professor_attendance_override(audit: AttendanceStatusAuditLog | None) -> bool:
+    return audit is not None and audit.change_source in PROFESSOR_ATTENDANCE_CHANGE_SOURCES
+
+
+def _catch_up_continuous_monitoring_states(db: Session, session: AttendanceSession, *, now: datetime) -> None:
+    account_now = _coerce_utc(now) or _utcnow()
+    assignments = _session_assignments_for_one(db, session)
+    enrolled_rows = _enrolled_students_for_course(db, session.course_id)
+    fallback_eligibility = {
+        "eligible": False,
+        "reason_code": "PRESENCE_SERVICE_UNAVAILABLE",
+    }
+    for assignment in assignments:
+        if account_now <= _slot_start_dt(assignment):
+            continue
+        for student_user_id, _, _ in enrolled_rows:
+            state = _ensure_monitoring_state(
+                db,
+                session=session,
+                assignment=assignment,
+                student_user_id=student_user_id,
+            )
+            _account_continuous_state(
+                state,
+                assignment=assignment,
+                eligibility=fallback_eligibility,
+                now=account_now,
+            )
+
+
 def _continuous_state_payload(state: AttendanceMonitoringState | None) -> dict[str, Any]:
     away_seconds = int(state.away_seconds if state else 0)
     return {
@@ -1506,6 +1561,7 @@ def _materialize_continuous_session_records(
     enrolled_rows = _enrolled_students_for_course(db, session.course_id)
     existing = _records_for_session(db, session.id)
     state_lookup = _monitoring_state_lookup(db, session.id)
+    latest_audits = _latest_attendance_audit_lookup(db, session.id)
     for student_user_id, _, _ in enrolled_rows:
         for assignment in assignments:
             state = state_lookup.get((student_user_id, assignment.projection_key))
@@ -1513,6 +1569,10 @@ def _materialize_continuous_session_records(
             final_reason = _continuous_audit_reason(final_status)
             key = (student_user_id, assignment.projection_key)
             record = existing.get(key)
+            if record is not None and _is_professor_attendance_override(latest_audits.get(key)):
+                if state is not None:
+                    state.finalized_at = changed_at
+                continue
             previous_status = record.final_status if record else None
             previous_reason = record.attendance_reason if record else None
             if record is None:
