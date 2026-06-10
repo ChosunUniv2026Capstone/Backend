@@ -502,6 +502,7 @@ class AdminClassroomNetworkThresholdUpdate(BaseModel):
 class AttendanceSessionBatchRequest(BaseModel):
     projection_keys: list[str] = Field(default_factory=list)
     mode: Literal["manual", "smart", "canceled"]
+    attendance_policy: Literal["smart_window_v1", "continuous_presence_v1"] | None = None
 
 
 class AttendanceRecordUpdateRequest(BaseModel):

@@ -1,6 +1,15 @@
 from functools import lru_cache
+import os
+import socket
+import uuid
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def default_attendance_monitoring_instance_id() -> str:
+    hostname = os.getenv("HOSTNAME") or socket.gethostname() or "backend"
+    return f"{hostname}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 class Settings(BaseSettings):
@@ -12,6 +21,10 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 1800
     db_pool_pre_ping: bool = True
     presence_service_url: str = "http://presence-service:8001"
+    attendance_monitoring_worker_enabled: bool = True
+    attendance_monitoring_worker_interval_seconds: float = 10.0
+    attendance_monitoring_lease_seconds: int = 30
+    attendance_monitoring_instance_id: str = Field(default_factory=default_attendance_monitoring_instance_id)
     assignment_upload_dir: str = "storage/assignments"
     object_storage_provider: str = "local"
     object_storage_local_dir: str = "storage/objects"

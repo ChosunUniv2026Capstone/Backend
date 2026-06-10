@@ -7,9 +7,13 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from sqlalchemy import Select, desc, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session
 
+from app.config import default_attendance_monitoring_instance_id
 from app.models import (
+    AttendanceMonitoringLease,
+    AttendanceMonitoringState,
     AttendanceRecord,
     AttendanceSession,
     AttendanceSessionSlot,
@@ -32,6 +36,28 @@ from app.presence_client import (
 SEMESTER_START = date(2026, 3, 3)
 SEMESTER_END = date(2026, 6, 30)
 SMART_ATTENDANCE_WINDOW_MINUTES = 10
+ATTENDANCE_POLICY_MANUAL = "manual_v1"
+ATTENDANCE_POLICY_SMART_WINDOW = "smart_window_v1"
+ATTENDANCE_POLICY_CONTINUOUS = "continuous_presence_v1"
+SMART_ATTENDANCE_POLICIES = {ATTENDANCE_POLICY_SMART_WINDOW, ATTENDANCE_POLICY_CONTINUOUS}
+CONTINUOUS_TICK_SECONDS = 10
+CONTINUOUS_UNKNOWN_GRACE_SECONDS = 60
+CONTINUOUS_LATE_SECONDS = 10 * 60
+CONTINUOUS_ABSENT_SECONDS = 15 * 60
+CONTINUOUS_LATE_REASON = "강의실 이탈로 인한 지각"
+CONTINUOUS_ABSENT_REASON = "강의실 이탈로 인한 결석"
+CONTINUOUS_DEPENDENCY_UNKNOWN_REASONS = {
+    "AP_OFFLINE",
+    "PRESENCE_SERVICE_UNAVAILABLE",
+    "COLLECTOR_REGISTRY_UNAVAILABLE",
+}
+PROFESSOR_ATTENDANCE_CHANGE_SOURCES = {"professor-manual", "professor-slot-exception"}
+ATTENDANCE_RECORD_CHANGE_SOURCES = PROFESSOR_ATTENDANCE_CHANGE_SOURCES | {
+    "self-checkin",
+    "smart-close-default",
+    "smart-expire-default",
+    "continuous-monitoring-expire",
+}
 FINAL_STATUSES = {"present", "absent", "late", "official", "sick"}
 SESSION_MODES = {"manual", "smart", "canceled"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -176,19 +202,22 @@ def _projection_slot_rows(db: Session, course: Course, professor: User) -> list[
 
             start_dt = datetime.combine(cursor, starts_at)
             end_dt = datetime.combine(cursor, ends_at)
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
             period_index = 1
             while start_dt + timedelta(minutes=30) <= end_dt:
                 slot_end_dt = start_dt + timedelta(minutes=30)
-                projection_key = create_projection_key(course.course_code, classroom_code, cursor, start_dt.time(), slot_end_dt.time())
+                slot_session_date = start_dt.date()
+                projection_key = create_projection_key(course.course_code, classroom_code, slot_session_date, start_dt.time(), slot_end_dt.time())
                 raw_slots.append(
                     {
                         "projection_key": projection_key,
                         "course_code": course.course_code,
                         "classroom_code": classroom_code,
-                        "session_date": cursor,
+                        "session_date": slot_session_date,
                         "slot_start_at": start_dt.time().replace(microsecond=0),
                         "slot_end_at": slot_end_dt.time().replace(microsecond=0),
-                        "week_start": cursor - timedelta(days=cursor.weekday()),
+                        "week_start": slot_session_date - timedelta(days=slot_session_date.weekday()),
                         "period_index_within_day": period_index,
                     }
                 )
@@ -246,6 +275,32 @@ def _coerce_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _session_policy(session: AttendanceSession) -> str:
+    return getattr(session, "attendance_policy", None) or (
+        ATTENDANCE_POLICY_MANUAL if session.mode == "manual" else ATTENDANCE_POLICY_SMART_WINDOW
+    )
+
+
+def _is_continuous_session(session: AttendanceSession) -> bool:
+    return session.mode == "smart" and _session_policy(session) == ATTENDANCE_POLICY_CONTINUOUS
+
+
+def _slot_start_dt(assignment: SessionSlotAssignment) -> datetime:
+    return datetime.combine(assignment.session_date, assignment.slot_start_at, tzinfo=UTC)
+
+
+def _slot_end_dt(assignment: SessionSlotAssignment) -> datetime:
+    slot_start = _slot_start_dt(assignment)
+    slot_end = datetime.combine(assignment.session_date, assignment.slot_end_at, tzinfo=UTC)
+    if slot_end <= slot_start:
+        slot_end += timedelta(days=1)
+    return slot_end
+
+
+def _session_continuous_expires_at(assignments: list[SessionSlotAssignment]) -> datetime:
+    return max(_slot_end_dt(assignment) for assignment in assignments)
 
 
 def _serialize_date(value: date) -> str:
@@ -328,8 +383,9 @@ def _assignment_from_projection_slot(classroom_id: int, slot: ProjectionSlot, *,
 
 
 def _bundle_bounds(assignments: list[SessionSlotAssignment]) -> tuple[time, time]:
-    ordered = sorted(assignments, key=lambda item: (item.slot_start_at, item.slot_order))
-    return ordered[0].slot_start_at, max(item.slot_end_at for item in ordered)
+    ordered_by_start = sorted(assignments, key=lambda item: (_slot_start_dt(item), item.slot_order))
+    final_assignment = max(assignments, key=_slot_end_dt)
+    return ordered_by_start[0].slot_start_at, final_assignment.slot_end_at
 
 
 def _projection_lookup_by_session(
@@ -459,6 +515,18 @@ def _materialize_smart_session_absences(
     changed_at: datetime,
 ) -> None:
     if session.mode != "smart":
+        return
+    if _is_continuous_session(session):
+        _catch_up_continuous_monitoring_states(db, session, now=changed_at)
+        _materialize_continuous_session_records(
+            db,
+            session,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            change_source=change_source,
+            version=version,
+            changed_at=changed_at,
+        )
         return
     assignments = _session_assignments_for_one(db, session)
     enrolled_rows = _enrolled_students_for_course(db, session.course_id)
@@ -597,6 +665,7 @@ def _serialize_slot(
         "slot_state": _slot_state(session),
         "session_id": session.id if session else None,
         "session_mode": session.mode if session else None,
+        "attendance_policy": _session_policy(session) if session else None,
         "session_status": session.status if session else None,
         "expires_at": (
             _serialize_dt(session.expires_at)
@@ -722,9 +791,24 @@ def open_attendance_sessions_batch(
     *,
     projection_keys: list[str],
     mode: Literal["manual", "smart", "canceled"],
+    attendance_policy: str | None = None,
 ) -> dict[str, Any]:
     if mode not in SESSION_MODES:
         raise attendance_api_error(400, "INVALID_SESSION_MODE", "invalid attendance session mode", {"mode": mode})
+    effective_policy = (
+        attendance_policy
+        if mode == "smart" and attendance_policy is not None
+        else ATTENDANCE_POLICY_SMART_WINDOW
+        if mode == "smart"
+        else ATTENDANCE_POLICY_MANUAL
+    )
+    if mode == "smart" and effective_policy not in SMART_ATTENDANCE_POLICIES:
+        raise attendance_api_error(
+            400,
+            "INVALID_ATTENDANCE_POLICY",
+            "invalid smart attendance policy",
+            {"attendance_policy": effective_policy},
+        )
     professor, course = get_owned_course(db, professor_id, course_code)
     slot_map = _projection_slot_lookup(db, course, professor)
     now = _utcnow()
@@ -853,6 +937,13 @@ def open_attendance_sessions_batch(
 
         anchor = valid_assignments[0]
         bundle_start_at, bundle_end_at = _bundle_bounds(valid_assignments)
+        session_expires_at = (
+            now + timedelta(minutes=SMART_ATTENDANCE_WINDOW_MINUTES)
+            if mode == "smart" and effective_policy == ATTENDANCE_POLICY_SMART_WINDOW
+            else _session_continuous_expires_at(valid_assignments)
+            if mode == "smart" and effective_policy == ATTENDANCE_POLICY_CONTINUOUS
+            else None
+        )
         session = AttendanceSession(
             projection_key=anchor.projection_key,
             course_id=course.id,
@@ -861,11 +952,12 @@ def open_attendance_sessions_batch(
             slot_start_at=bundle_start_at,
             slot_end_at=bundle_end_at,
             mode=mode,
+            attendance_policy=effective_policy,
             status="canceled" if mode == "canceled" else "active",
             opened_by_user_id=professor.id,
             opened_at=now,
             closed_at=now if mode == "canceled" else None,
-            expires_at=now + timedelta(minutes=SMART_ATTENDANCE_WINDOW_MINUTES) if mode == "smart" else None,
+            expires_at=session_expires_at,
             latest_version=1,
         )
         db.add(session)
@@ -891,6 +983,7 @@ def open_attendance_sessions_batch(
                 "message": "attendance session applied",
                 "session_id": session.id,
                 "resulting_slot_state": _slot_state(session),
+                "attendance_policy": _session_policy(session),
                 "event_type": (
                     "session.canceled"
                     if mode == "canceled"
@@ -911,6 +1004,7 @@ def open_attendance_sessions_batch(
         return {
             "course_code": course.course_code,
             "mode": mode,
+            "attendance_policy": effective_policy,
             "results": results,
             "changed_projection_keys": [assignment.projection_key for assignment in valid_assignments],
             "changed_session_ids": [session.id],
@@ -920,6 +1014,7 @@ def open_attendance_sessions_batch(
     return {
         "course_code": course.course_code,
         "mode": mode,
+        "attendance_policy": effective_policy,
         "results": results,
         "changed_projection_keys": [],
         "changed_session_ids": [],
@@ -943,6 +1038,7 @@ def close_attendance_session(db: Session, professor_id: str, session_id: int) ->
             "projection_key": session.projection_key,
             "projection_keys": projection_keys,
             "status": session.status,
+            "attendance_policy": _session_policy(session),
             "version": session.latest_version,
             "occurred_at": _serialize_dt(_utcnow()),
         }
@@ -970,6 +1066,7 @@ def close_attendance_session(db: Session, professor_id: str, session_id: int) ->
         "projection_key": session.projection_key,
         "projection_keys": projection_keys,
         "status": session.status,
+        "attendance_policy": _session_policy(session),
         "version": session.latest_version,
         "occurred_at": _serialize_dt(session.closed_at),
         "course_code": course.course_code,
@@ -1005,6 +1102,516 @@ def _records_for_session(db: Session, session_id: int) -> dict[tuple[int, str], 
     return {(record.student_user_id, record.projection_key): record for record in records}
 
 
+def _continuous_status_candidate(away_seconds: int) -> str:
+    if away_seconds >= CONTINUOUS_ABSENT_SECONDS:
+        return "absent"
+    if away_seconds >= CONTINUOUS_LATE_SECONDS:
+        return "late"
+    return "present"
+
+
+def _continuous_audit_reason(status: str) -> str | None:
+    if status == "late":
+        return CONTINUOUS_LATE_REASON
+    if status == "absent":
+        return CONTINUOUS_ABSENT_REASON
+    return None
+
+
+def _monitoring_state_lookup(db: Session, session_id: int) -> dict[tuple[int, str], AttendanceMonitoringState]:
+    rows = db.scalars(
+        select(AttendanceMonitoringState).where(AttendanceMonitoringState.attendance_session_id == session_id)
+    ).all()
+    return {(row.student_user_id, row.projection_key): row for row in rows}
+
+
+def _latest_attendance_audit_lookup(db: Session, session_id: int) -> dict[tuple[int, str], AttendanceStatusAuditLog]:
+    rows = db.scalars(
+        select(AttendanceStatusAuditLog)
+        .where(
+            AttendanceStatusAuditLog.attendance_session_id == session_id,
+            AttendanceStatusAuditLog.change_source.in_(ATTENDANCE_RECORD_CHANGE_SOURCES),
+        )
+        .order_by(desc(AttendanceStatusAuditLog.changed_at), desc(AttendanceStatusAuditLog.id))
+    ).all()
+    lookup: dict[tuple[int, str], AttendanceStatusAuditLog] = {}
+    for row in rows:
+        key = (row.student_user_id, row.projection_key)
+        if key not in lookup:
+            lookup[key] = row
+    return lookup
+
+
+def _is_professor_attendance_override(audit: AttendanceStatusAuditLog | None) -> bool:
+    return audit is not None and audit.change_source in PROFESSOR_ATTENDANCE_CHANGE_SOURCES
+
+
+def _catch_up_continuous_monitoring_states(db: Session, session: AttendanceSession, *, now: datetime) -> None:
+    account_now = _coerce_utc(now) or _utcnow()
+    assignments = _session_assignments_for_one(db, session)
+    enrolled_rows = _enrolled_students_for_course(db, session.course_id)
+    fallback_eligibility = {
+        "eligible": False,
+        "reason_code": "PRESENCE_SERVICE_UNAVAILABLE",
+    }
+    for assignment in assignments:
+        if account_now <= _slot_start_dt(assignment):
+            continue
+        for student_user_id, _, _ in enrolled_rows:
+            state = _ensure_monitoring_state(
+                db,
+                session=session,
+                assignment=assignment,
+                student_user_id=student_user_id,
+            )
+            _account_continuous_state(
+                state,
+                assignment=assignment,
+                eligibility=fallback_eligibility,
+                now=account_now,
+            )
+
+
+def _continuous_state_payload(state: AttendanceMonitoringState | None) -> dict[str, Any]:
+    away_seconds = int(state.away_seconds if state else 0)
+    return {
+        "current_presence_state": state.current_presence_state if state else "outside_time",
+        "last_presence_reason": state.last_presence_reason if state else None,
+        "status_candidate": state.status_candidate if state else "present",
+        "away_seconds": away_seconds,
+        "away_minutes": away_seconds // 60,
+        "unknown_seconds_consumed": int(state.unknown_seconds_consumed if state else 0),
+        "last_accounted_until": _serialize_dt(state.last_accounted_until) if state else None,
+        "finalized_at": _serialize_dt(state.finalized_at) if state else None,
+    }
+
+
+def _continuous_panel_color(state: AttendanceMonitoringState | None, *, now: datetime, assignment: SessionSlotAssignment) -> str:
+    slot_start = _slot_start_dt(assignment)
+    slot_end = _slot_end_dt(assignment)
+    if now < slot_start or now >= slot_end:
+        return "gray"
+    if state is not None and state.current_presence_state == "present":
+        return "green"
+    return "red"
+
+
+def _continuous_panel_payload(
+    state: AttendanceMonitoringState | None,
+    *,
+    now: datetime,
+    assignment: SessionSlotAssignment,
+) -> dict[str, Any]:
+    return {
+        **_continuous_state_payload(state),
+        "panel_color": _continuous_panel_color(
+            state,
+            now=now,
+            assignment=assignment,
+        ),
+    }
+
+
+def _continuous_display_assignment(assignments: list[SessionSlotAssignment], *, now: datetime) -> SessionSlotAssignment:
+    return next(
+        (assignment for assignment in assignments if _slot_start_dt(assignment) <= now < _slot_end_dt(assignment)),
+        assignments[0],
+    )
+
+
+def _continuous_roster_summary(slot_states: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not slot_states:
+        return _continuous_state_payload(None)
+    return max(slot_states.values(), key=lambda payload: int(payload.get("away_seconds") or 0))
+
+
+def _ensure_monitoring_state(
+    db: Session,
+    *,
+    session: AttendanceSession,
+    assignment: SessionSlotAssignment,
+    student_user_id: int,
+) -> AttendanceMonitoringState:
+    state = db.scalar(
+        select(AttendanceMonitoringState).where(
+            AttendanceMonitoringState.attendance_session_id == session.id,
+            AttendanceMonitoringState.projection_key == assignment.projection_key,
+            AttendanceMonitoringState.student_user_id == student_user_id,
+        )
+    )
+    if state is not None:
+        return state
+    state = AttendanceMonitoringState(
+        attendance_session_id=session.id,
+        projection_key=assignment.projection_key,
+        student_user_id=student_user_id,
+        slot_start_at=assignment.slot_start_at,
+        slot_end_at=assignment.slot_end_at,
+        last_accounted_until=None,
+        away_seconds=0,
+        unknown_seconds_consumed=0,
+        current_presence_state="outside_time",
+        last_presence_reason=None,
+        status_candidate="present",
+    )
+    db.add(state)
+    db.flush()
+    return state
+
+
+def _acquire_monitoring_lease(
+    db: Session,
+    *,
+    session: AttendanceSession,
+    instance_id: str,
+    now: datetime,
+    lease_seconds: int,
+) -> bool:
+    lease_until = now + timedelta(seconds=lease_seconds)
+    if db.get_bind().dialect.name == "postgresql":
+        table = AttendanceMonitoringLease.__table__
+        statement = (
+            postgres_insert(table)
+            .values(
+                attendance_session_id=session.id,
+                lease_owner=instance_id,
+                lease_until=lease_until,
+                heartbeat_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[table.c.attendance_session_id],
+                set_={
+                    "lease_owner": instance_id,
+                    "lease_until": lease_until,
+                    "heartbeat_at": now,
+                    "updated_at": func.now(),
+                },
+                where=or_(table.c.lease_until <= now, table.c.lease_owner == instance_id),
+            )
+            .returning(table.c.attendance_session_id)
+        )
+        return db.execute(statement).first() is not None
+
+    lease = db.scalar(
+        select(AttendanceMonitoringLease)
+        .where(AttendanceMonitoringLease.attendance_session_id == session.id)
+        .with_for_update()
+    )
+    if lease is not None:
+        current_lease_until = _coerce_utc(lease.lease_until)
+        if current_lease_until and current_lease_until > now and lease.owner_instance_id != instance_id:
+            return False
+        lease.owner_instance_id = instance_id
+        lease.lease_until = lease_until
+        lease.heartbeat_at = now
+    else:
+        db.add(
+            AttendanceMonitoringLease(
+                attendance_session_id=session.id,
+                owner_instance_id=instance_id,
+                lease_until=lease_until,
+                heartbeat_at=now,
+            )
+        )
+    db.flush()
+    return True
+
+
+def _account_continuous_state(
+    state: AttendanceMonitoringState,
+    *,
+    assignment: SessionSlotAssignment,
+    eligibility: dict[str, Any],
+    now: datetime,
+) -> str | None:
+    slot_start = _slot_start_dt(assignment)
+    slot_end = _slot_end_dt(assignment)
+    if now <= slot_start:
+        state.current_presence_state = "outside_time"
+        state.last_presence_reason = None
+        return None
+
+    account_until = min(now, slot_end)
+    had_previous_accounting = state.last_accounted_until is not None
+    previous_accounted_until = _coerce_utc(state.last_accounted_until) or slot_start
+    if previous_accounted_until < slot_start:
+        previous_accounted_until = slot_start
+    if account_until <= previous_accounted_until:
+        return None
+
+    delta_seconds = int((account_until - previous_accounted_until).total_seconds())
+    reason_code = str(eligibility.get("reason_code") or "UNKNOWN")
+    previous_candidate = state.status_candidate
+    if eligibility.get("eligible"):
+        if not had_previous_accounting:
+            state.away_seconds = int(state.away_seconds or 0) + delta_seconds
+        state.current_presence_state = "present"
+    elif reason_code in CONTINUOUS_DEPENDENCY_UNKNOWN_REASONS:
+        remaining_unknown = max(0, CONTINUOUS_UNKNOWN_GRACE_SECONDS - int(state.unknown_seconds_consumed or 0))
+        unknown_delta = min(delta_seconds, remaining_unknown)
+        away_delta = delta_seconds - unknown_delta
+        state.unknown_seconds_consumed = int(state.unknown_seconds_consumed or 0) + unknown_delta
+        state.away_seconds = int(state.away_seconds or 0) + away_delta
+        state.current_presence_state = "unknown" if away_delta == 0 else "away"
+    else:
+        state.away_seconds = int(state.away_seconds or 0) + delta_seconds
+        state.current_presence_state = "away"
+    state.last_presence_reason = reason_code
+    state.last_accounted_until = account_until
+    state.status_candidate = _continuous_status_candidate(int(state.away_seconds or 0))
+    if state.status_candidate != previous_candidate and state.status_candidate in {"late", "absent"}:
+        return previous_candidate
+    return None
+
+
+def _append_continuous_audit(
+    db: Session,
+    *,
+    session: AttendanceSession,
+    assignment: SessionSlotAssignment,
+    student_user_id: int,
+    previous_status: str | None,
+    new_status: str,
+    now: datetime,
+    version: int,
+    change_source: str,
+) -> None:
+    db.add(
+        AttendanceStatusAuditLog(
+            attendance_session_id=session.id,
+            projection_key=assignment.projection_key,
+            student_user_id=student_user_id,
+            actor_user_id=session.opened_by_user_id,
+            actor_role="system",
+            change_source=change_source,
+            previous_status=previous_status,
+            new_status=new_status,
+            reason=_continuous_audit_reason(new_status),
+            changed_at=now,
+            version=version,
+        )
+    )
+
+
+def tick_continuous_attendance_sessions(
+    db: Session,
+    presence_client: PresenceClient,
+    *,
+    instance_id: str | None = None,
+    now: datetime | None = None,
+    lease_seconds: int = 30,
+    course_code: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run one lease-protected continuous attendance tick."""
+
+    tick_now = _coerce_utc(now) or _utcnow()
+    effective_instance_id = instance_id or default_attendance_monitoring_instance_id()
+    query: Select[tuple[AttendanceSession, Course]] = (
+        select(AttendanceSession, Course)
+        .join(Course, Course.id == AttendanceSession.course_id)
+        .where(
+            AttendanceSession.mode == "smart",
+            AttendanceSession.status == "active",
+            AttendanceSession.attendance_policy == ATTENDANCE_POLICY_CONTINUOUS,
+        )
+    )
+    if course_code is not None:
+        query = query.where(Course.course_code == course_code)
+
+    events: list[dict[str, Any]] = []
+    rows = db.execute(query).all()
+    for session, course in rows:
+        if not _acquire_monitoring_lease(
+            db,
+            session=session,
+            instance_id=effective_instance_id,
+            now=tick_now,
+            lease_seconds=lease_seconds,
+        ):
+            continue
+        db.commit()
+        assignments = _session_assignments_for_one(db, session)
+        enrolled_rows = _enrolled_students_for_course(db, session.course_id)
+        changed_projection_keys: set[str] = set()
+        pending_audits: list[tuple[SessionSlotAssignment, int, str | None, str]] = []
+        eligibility_results: list[tuple[SessionSlotAssignment, int, dict[str, Any]]] = []
+        lease_lost = False
+        for assignment in assignments:
+            if tick_now <= _slot_start_dt(assignment):
+                continue
+            for student_user_id, _, _ in enrolled_rows:
+                student = db.get(User, student_user_id)
+                if student is None:
+                    continue
+                if not _acquire_monitoring_lease(
+                    db,
+                    session=session,
+                    instance_id=effective_instance_id,
+                    now=_utcnow(),
+                    lease_seconds=lease_seconds,
+                ):
+                    lease_lost = True
+                    break
+                db.commit()
+                eligibility = _presence_eligibility_for_assignment(
+                    db,
+                    presence_client,
+                    student,
+                    course,
+                    assignment,
+                    _registered_devices_payload(db, student),
+                    persist_log=False,
+                    release_connection_before_check=True,
+                )
+                eligibility_results.append((assignment, student_user_id, eligibility))
+            if lease_lost:
+                break
+        if lease_lost:
+            continue
+        for assignment, student_user_id, eligibility in eligibility_results:
+            state = _ensure_monitoring_state(
+                db,
+                session=session,
+                assignment=assignment,
+                student_user_id=student_user_id,
+            )
+            previous_candidate = _account_continuous_state(
+                state,
+                assignment=assignment,
+                eligibility=eligibility,
+                now=tick_now,
+            )
+            if previous_candidate is not None:
+                changed_projection_keys.add(assignment.projection_key)
+                if previous_candidate == "present" and state.status_candidate == "absent":
+                    pending_audits.append((assignment, student_user_id, "present", "late"))
+                    pending_audits.append((assignment, student_user_id, "late", "absent"))
+                else:
+                    pending_audits.append(
+                        (assignment, student_user_id, previous_candidate, state.status_candidate)
+                    )
+        if pending_audits:
+            session.latest_version += 1
+            for assignment, student_user_id, previous_status, new_status in pending_audits:
+                _append_continuous_audit(
+                    db,
+                    session=session,
+                    assignment=assignment,
+                    student_user_id=student_user_id,
+                    previous_status=previous_status,
+                    new_status=new_status,
+                    now=tick_now,
+                    version=session.latest_version,
+                    change_source="continuous-monitoring",
+                )
+            events.append(
+                {
+                    "course_code": course.course_code,
+                    "projection_key": session.projection_key,
+                    "projection_keys": sorted(changed_projection_keys),
+                    "session_id": session.id,
+                    "version": session.latest_version,
+                    "event_type": "attendance.continuous.updated",
+                    "occurred_at": _serialize_dt(tick_now),
+                }
+            )
+        expires_at = _coerce_utc(session.expires_at)
+        session_due = expires_at is not None and expires_at <= tick_now
+        assignments_due = bool(assignments) and all(_slot_end_dt(assignment) <= tick_now for assignment in assignments)
+        if session_due or assignments_due:
+            session.latest_version += 1
+            _materialize_continuous_session_records(
+                db,
+                session,
+                actor_user_id=session.opened_by_user_id,
+                actor_role="system",
+                change_source="continuous-monitoring-expire",
+                version=session.latest_version,
+                changed_at=tick_now,
+            )
+            session.status = "expired"
+            session.closed_at = tick_now
+            session.expires_at = None
+            events.append(
+                {
+                    "course_code": course.course_code,
+                    "projection_key": session.projection_key,
+                    "projection_keys": [assignment.projection_key for assignment in assignments],
+                    "session_id": session.id,
+                    "version": session.latest_version,
+                    "event_type": "session.expired",
+                    "occurred_at": _serialize_dt(tick_now),
+                }
+            )
+    db.commit()
+    return events
+
+
+def _materialize_continuous_session_records(
+    db: Session,
+    session: AttendanceSession,
+    *,
+    actor_user_id: int,
+    actor_role: str,
+    change_source: str,
+    version: int,
+    changed_at: datetime,
+) -> None:
+    assignments = _session_assignments_for_one(db, session)
+    enrolled_rows = _enrolled_students_for_course(db, session.course_id)
+    existing = _records_for_session(db, session.id)
+    state_lookup = _monitoring_state_lookup(db, session.id)
+    latest_audits = _latest_attendance_audit_lookup(db, session.id)
+    for student_user_id, _, _ in enrolled_rows:
+        for assignment in assignments:
+            state = state_lookup.get((student_user_id, assignment.projection_key))
+            final_status = state.status_candidate if state is not None else "absent"
+            final_reason = _continuous_audit_reason(final_status)
+            key = (student_user_id, assignment.projection_key)
+            record = existing.get(key)
+            if record is not None and _is_professor_attendance_override(latest_audits.get(key)):
+                if state is not None:
+                    state.finalized_at = changed_at
+                continue
+            previous_status = record.final_status if record else None
+            previous_reason = record.attendance_reason if record else None
+            if record is None:
+                record = AttendanceRecord(
+                    attendance_session_id=session.id,
+                    projection_key=assignment.projection_key,
+                    student_user_id=student_user_id,
+                    final_status=final_status,
+                    attendance_reason=final_reason,
+                    finalized_by_user_id=actor_user_id,
+                    finalized_at=changed_at,
+                )
+                existing[key] = record
+                db.add(record)
+            else:
+                record.final_status = final_status
+                record.attendance_reason = final_reason
+                record.finalized_by_user_id = actor_user_id
+                record.finalized_at = changed_at
+            if state is not None:
+                state.finalized_at = changed_at
+            if previous_status != final_status or previous_reason != final_reason:
+                db.add(
+                    AttendanceStatusAuditLog(
+                        attendance_session_id=session.id,
+                        projection_key=assignment.projection_key,
+                        student_user_id=student_user_id,
+                        actor_user_id=actor_user_id,
+                        actor_role=actor_role,
+                        change_source=change_source,
+                        previous_status=previous_status,
+                        new_status=final_status,
+                        reason=final_reason,
+                        changed_at=changed_at,
+                        version=version,
+                    )
+                )
+
+
 
 def _student_slot_statuses(
     record_lookup: dict[tuple[int, str], AttendanceRecord],
@@ -1037,6 +1644,7 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
     history_counts = _history_counts_for_course(db, course.id)
     record_lookup = _records_for_session(db, session.id)
     resolved_record_lookup = _records_for_sessions(db, [session.id])
+    state_lookup = _monitoring_state_lookup(db, session.id) if _is_continuous_session(session) else {}
     resolved_counts = _resolved_counts_for_session_slots(
         session,
         assignments,
@@ -1046,6 +1654,13 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
     students = []
     for student_user_id, student_login_id, student_name in enrolled_rows:
         anchor_record = record_lookup.get((student_user_id, session.projection_key))
+        continuous_slots = {
+            assignment.projection_key: _continuous_state_payload(
+                state_lookup.get((student_user_id, assignment.projection_key))
+            )
+            for assignment in assignments
+        }
+        continuous_summary = _continuous_roster_summary(continuous_slots)
         students.append(
             {
                 "student_id": student_login_id,
@@ -1058,6 +1673,17 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
                 "attendance_reason": anchor_record.attendance_reason if anchor_record else None,
                 "history_count": history_counts.get(student_user_id, 0),
                 "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
+                "away_seconds": continuous_summary["away_seconds"] if _is_continuous_session(session) else None,
+                "away_minutes": continuous_summary["away_minutes"] if _is_continuous_session(session) else None,
+                "current_presence_state": continuous_summary["current_presence_state"] if _is_continuous_session(session) else None,
+                "last_presence_reason": continuous_summary["last_presence_reason"] if _is_continuous_session(session) else None,
+                "status_candidate": continuous_summary["status_candidate"] if _is_continuous_session(session) else None,
+                "monitoring_state": continuous_summary if _is_continuous_session(session) else None,
+                "continuous_presence": {
+                    "away_seconds": continuous_summary["away_seconds"],
+                    "away_minutes": continuous_summary["away_minutes"],
+                    "slots": continuous_slots,
+                } if _is_continuous_session(session) else None,
             }
         )
     aggregate = _aggregate_projection_counts(resolved_counts, assignments)
@@ -1068,6 +1694,7 @@ def get_attendance_session_roster(db: Session, professor_id: str, session_id: in
             "projection_keys": [assignment.projection_key for assignment in assignments],
             "included_slots": [_serialize_assignment(slot_map, assignment) for assignment in assignments],
             "mode": session.mode,
+            "attendance_policy": _session_policy(session),
             "status": session.status,
             "expires_at": _serialize_dt(session.expires_at),
             "version": session.latest_version,
@@ -1103,6 +1730,7 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
         assignments = _session_assignments_for_one(db, latest_session)
         record_lookup = _records_for_session(db, latest_session.id)
         resolved_record_lookup = _records_for_sessions(db, [latest_session.id])
+        state_lookup = _monitoring_state_lookup(db, latest_session.id) if _is_continuous_session(latest_session) else {}
         history_counts = _history_counts_for_course(db, course.id)
         enrolled_rows = _enrolled_students_for_course(db, course.id)
         resolved_counts = _resolved_counts_for_session_slots(
@@ -1114,6 +1742,8 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
         students = []
         for student_user_id, student_login_id, student_name in enrolled_rows:
             record = record_lookup.get((student_user_id, projection_key))
+            continuous_state = state_lookup.get((student_user_id, projection_key))
+            continuous_payload = _continuous_state_payload(continuous_state)
             students.append(
                 {
                     "student_id": student_login_id,
@@ -1126,6 +1756,13 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
                     "attendance_reason": record.attendance_reason if record else None,
                     "history_count": history_counts.get(student_user_id, 0),
                     "slot_statuses": _student_slot_statuses(record_lookup, student_user_id, assignments),
+                    "continuous_presence": continuous_payload if _is_continuous_session(latest_session) else None,
+                    "monitoring_state": continuous_payload if _is_continuous_session(latest_session) else None,
+                    "away_seconds": continuous_payload["away_seconds"] if _is_continuous_session(latest_session) else None,
+                    "away_minutes": continuous_payload["away_minutes"] if _is_continuous_session(latest_session) else None,
+                    "current_presence_state": continuous_payload["current_presence_state"] if _is_continuous_session(latest_session) else None,
+                    "last_presence_reason": continuous_payload["last_presence_reason"] if _is_continuous_session(latest_session) else None,
+                    "status_candidate": continuous_payload["status_candidate"] if _is_continuous_session(latest_session) else None,
                 }
             )
         aggregate = resolved_counts.get(projection_key, _counts_template())
@@ -1136,6 +1773,7 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
                 "projection_keys": [assignment.projection_key for assignment in assignments],
                 "included_slots": [_serialize_assignment(slot_map, assignment) for assignment in assignments],
                 "mode": latest_session.mode,
+                "attendance_policy": _session_policy(latest_session),
                 "status": latest_session.status,
                 "expires_at": _serialize_dt(latest_session.expires_at),
                 "version": latest_session.latest_version,
@@ -1182,6 +1820,7 @@ def get_attendance_slot_roster_preview(db: Session, professor_id: str, course_co
                 }
             ],
             "mode": None,
+            "attendance_policy": None,
             "status": "unchecked",
             "expires_at": None,
             "version": 0,
@@ -1697,23 +2336,46 @@ def list_student_active_attendance_sessions(
     assignments_by_session = _session_slot_assignments(db, sessions)
     registered_devices = _registered_devices_payload(db, student)
     serialized_sessions = []
+    now = _utcnow()
     for session in sessions:
         assignments = assignments_by_session.get(session.id, [_fallback_session_assignment(session)])
-        eligibilities = [
-            {
-                "projection_key": assignment.projection_key,
-                "eligibility": _presence_eligibility_for_assignment(
-                    db,
-                    presence_client,
-                    student,
-                    course,
-                    assignment,
-                    registered_devices,
-                ),
-            }
-            for assignment in assignments
-        ]
-        changed_or_present = [item for item in eligibilities if item["eligibility"]["eligible"]]
+        if _is_continuous_session(session):
+            state_lookup = _monitoring_state_lookup(db, session.id)
+            display_assignment = _continuous_display_assignment(assignments, now=now)
+            display_payload = _continuous_panel_payload(
+                state_lookup.get((student.id, display_assignment.projection_key)),
+                now=now,
+                assignment=display_assignment,
+            )
+            eligibilities = [
+                {
+                    "projection_key": assignment.projection_key,
+                    "eligibility": None,
+                    "continuous_presence": _continuous_panel_payload(
+                        state_lookup.get((student.id, assignment.projection_key)),
+                        now=now,
+                        assignment=assignment,
+                    ),
+                }
+                for assignment in assignments
+            ]
+            changed_or_present: list[dict[str, Any]] = []
+        else:
+            eligibilities = [
+                {
+                    "projection_key": assignment.projection_key,
+                    "eligibility": _presence_eligibility_for_assignment(
+                        db,
+                        presence_client,
+                        student,
+                        course,
+                        assignment,
+                        registered_devices,
+                    ),
+                }
+                for assignment in assignments
+            ]
+            changed_or_present = [item for item in eligibilities if item["eligibility"]["eligible"]]
         anchor_slot = slot_map.get(session.projection_key)
         serialized_sessions.append(
             {
@@ -1726,7 +2388,17 @@ def list_student_active_attendance_sessions(
                 "slot_start_at": _serialize_time(session.slot_start_at),
                 "slot_end_at": _serialize_time(session.slot_end_at),
                 "expires_at": _serialize_dt(session.expires_at),
-                "can_check_in": bool(changed_or_present),
+                "attendance_policy": _session_policy(session),
+                "can_check_in": False if _is_continuous_session(session) else bool(changed_or_present),
+                "check_in_policy": "disabled_continuous_presence" if _is_continuous_session(session) else "smart_window_self_check_in",
+                "panel_color": display_payload["panel_color"] if _is_continuous_session(session) else None,
+                "status_panel_color": display_payload["panel_color"] if _is_continuous_session(session) else None,
+                "current_presence_state": display_payload["current_presence_state"] if _is_continuous_session(session) else None,
+                "away_seconds": display_payload["away_seconds"] if _is_continuous_session(session) else None,
+                "away_minutes": display_payload["away_minutes"] if _is_continuous_session(session) else None,
+                "last_presence_reason": display_payload["last_presence_reason"] if _is_continuous_session(session) else None,
+                "status_candidate": display_payload["status_candidate"] if _is_continuous_session(session) else None,
+                "monitoring_state": display_payload if _is_continuous_session(session) else None,
                 "eligibility": {
                     "eligible_slot_count": len(changed_or_present),
                     "rejected_slot_count": len(eligibilities) - len(changed_or_present),
@@ -1758,6 +2430,35 @@ def student_attendance_check_in(db: Session, presence_client: PresenceClient, st
         raise attendance_api_error(409, "SESSION_NOT_OPEN", "smart attendance session is not open", {"session_id": session_id})
 
     assignments = _session_assignments_for_one(db, session)
+    if _is_continuous_session(session):
+        now = _utcnow()
+        db.commit()
+        return {
+            "code": "CONTINUOUS_ATTENDANCE_CHECK_IN_INERT",
+            "session_id": session.id,
+            "projection_key": session.projection_key,
+            "projection_keys": [assignment.projection_key for assignment in assignments],
+            "changed_projection_keys": [],
+            "student_id": student_id,
+            "status": "inert",
+            "version": session.latest_version,
+            "occurred_at": _serialize_dt(now),
+            "course_code": course.course_code,
+            "idempotent": True,
+            "changed_count": 0,
+            "already_present_count": 0,
+            "rejected_count": 0,
+            "results": [
+                {
+                    "projection_key": assignment.projection_key,
+                    "result": "inert",
+                    "reason_code": "CONTINUOUS_ATTENDANCE_CHECK_IN_INERT",
+                    "eligibility": None,
+                }
+                for assignment in assignments
+            ],
+        }
+
     registered_devices = _registered_devices_payload(db, student)
     now = _utcnow()
     pending_audits: list[AttendanceStatusAuditLog] = []

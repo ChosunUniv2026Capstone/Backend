@@ -14,7 +14,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import get_db
 from app.main import app
+from app.attendance import expire_stale_attendance_sessions, tick_continuous_attendance_sessions
 from app.models import (
+    AttendanceMonitoringLease,
+    AttendanceMonitoringState,
     AttendanceRecord,
     AttendanceSession,
     AttendanceSessionSlot,
@@ -35,6 +38,7 @@ class FakePresenceClient:
     def __init__(self) -> None:
         self.reason_code = "OK"
         self.next_exception = None
+        self.calls: list[dict] = []
 
     def check_eligibility(
         self,
@@ -46,6 +50,14 @@ class FakePresenceClient:
         classroom_networks: list[dict],
         registered_devices: list[dict],
     ) -> dict:
+        self.calls.append(
+            {
+                "student_id": student_id,
+                "course_id": course_id,
+                "classroom_id": classroom_id,
+                "purpose": purpose,
+            }
+        )
         if self.next_exception is not None:
             raise self.next_exception
         return {
@@ -220,6 +232,44 @@ def _open_bundle_session(client: TestClient, mode: str = "smart") -> tuple[int, 
     payload = api_json(response)
     assert payload["changed_session_ids"]
     return payload["changed_session_ids"][0], [first_projection_key, second_projection_key]
+
+
+def _open_continuous_session(client: TestClient) -> tuple[int, str]:
+    projection_key = _first_projection_key(client)
+    response = client.post(
+        "/api/professors/PRF002/courses/CSE116/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={
+            "projection_keys": [projection_key],
+            "mode": "smart",
+            "attendance_policy": "continuous_presence_v1",
+        },
+    )
+    assert response.status_code == 200
+    payload = api_json(response)
+    result = payload["results"][0]
+    assert result["success"] is True
+    assert result["attendance_policy"] == "continuous_presence_v1"
+    return result["session_id"], projection_key
+
+
+def _move_session_window(session_local: sessionmaker, session_id: int, *, started_minutes_ago: int, ends_in_minutes: int) -> datetime:
+    now = datetime.now(UTC).replace(microsecond=0)
+    starts_at = now - timedelta(minutes=started_minutes_ago)
+    ends_at = now + timedelta(minutes=ends_in_minutes)
+    with session_local.begin() as db:
+        session = db.get(AttendanceSession, session_id)
+        assert session is not None
+        session.session_date = now.date()
+        session.slot_start_at = starts_at.time().replace(microsecond=0)
+        session.slot_end_at = ends_at.time().replace(microsecond=0)
+        session.expires_at = ends_at
+        slots = db.scalars(select(AttendanceSessionSlot).where(AttendanceSessionSlot.attendance_session_id == session_id)).all()
+        for slot in slots:
+            slot.session_date = now.date()
+            slot.slot_start_at = starts_at.time().replace(microsecond=0)
+            slot.slot_end_at = ends_at.time().replace(microsecond=0)
+    return now
 
 
 
@@ -729,6 +779,447 @@ def test_student_check_in_is_idempotent_and_updates_report() -> None:
     )
     assert report.status_code == 200
     assert api_json(report)["present"] == 1
+
+
+def test_continuous_session_disables_check_in_and_exposes_status_panel() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    session_id, _ = _open_continuous_session(client)
+    _move_session_window(SessionLocal, session_id, started_minutes_ago=1, ends_in_minutes=29)
+    fake_presence.calls.clear()
+
+    active = client.get(
+        "/api/students/20201239/courses/CSE116/attendance/active-sessions",
+        headers=auth_header("20201239"),
+    )
+
+    assert active.status_code == 200
+    session = api_json(active)["sessions"][0]
+    assert session["attendance_policy"] == "continuous_presence_v1"
+    assert session["can_check_in"] is False
+    assert session["check_in_policy"] == "disabled_continuous_presence"
+    assert session["panel_color"] in {"green", "red"}
+    assert session["monitoring_state"]["panel_color"] == session["panel_color"]
+    assert session["eligibility"]["per_slot"][0]["eligibility"] is None
+    assert session["eligibility"]["per_slot"][0]["continuous_presence"]["panel_color"] in {"green", "red"}
+
+    check_in = client.post(
+        f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
+        headers=auth_header("20201239"),
+    )
+
+    assert check_in.status_code == 200
+    payload = api_json(check_in)
+    assert payload["status"] == "inert"
+    assert payload["changed_count"] == 0
+    assert payload["results"][0]["reason_code"] == "CONTINUOUS_ATTENDANCE_CHECK_IN_INERT"
+    assert fake_presence.calls == []
+    with SessionLocal() as db:
+        assert db.query(AttendanceRecord).filter_by(attendance_session_id=session_id).count() == 0
+        assert db.query(AttendanceStatusAuditLog).filter_by(attendance_session_id=session_id).count() == 0
+
+
+def test_continuous_tick_accounts_unknown_grace_and_respects_lease() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=16, ends_in_minutes=14)
+
+    with SessionLocal() as db:
+        events = tick_continuous_attendance_sessions(
+            db,
+            fake_presence,
+            instance_id="worker-a",
+            now=tick_now,
+            lease_seconds=30,
+        )
+
+    assert events
+    with SessionLocal() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        state = db.scalar(
+            select(AttendanceMonitoringState).where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+                AttendanceMonitoringState.student_user_id == student.id,
+            )
+        )
+        assert state is not None
+        assert state.unknown_seconds_consumed == 60
+        assert state.away_seconds == 900
+        assert state.current_presence_state == "away"
+        assert state.last_presence_reason == "AP_OFFLINE"
+        assert state.status_candidate == "absent"
+        audit = db.scalar(
+            select(AttendanceStatusAuditLog).where(
+                AttendanceStatusAuditLog.attendance_session_id == session_id,
+                AttendanceStatusAuditLog.student_user_id == student.id,
+                AttendanceStatusAuditLog.new_status == "absent",
+            )
+        )
+        assert audit is not None
+        assert audit.reason == "강의실 이탈로 인한 결석"
+        lease = db.scalar(select(AttendanceMonitoringLease).where(AttendanceMonitoringLease.attendance_session_id == session_id))
+        assert lease is not None
+        assert lease.owner_instance_id == "worker-a"
+
+    with SessionLocal() as db:
+        blocked_events = tick_continuous_attendance_sessions(
+            db,
+            fake_presence,
+            instance_id="worker-b",
+            now=tick_now + timedelta(seconds=1),
+            lease_seconds=30,
+        )
+    assert blocked_events == []
+    with SessionLocal() as db:
+        lease = db.scalar(select(AttendanceMonitoringLease).where(AttendanceMonitoringLease.attendance_session_id == session_id))
+        assert lease is not None
+        assert lease.owner_instance_id == "worker-a"
+
+
+def test_continuous_professor_roster_flattens_monitoring_summary() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, _ = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=12, ends_in_minutes=18)
+    with SessionLocal() as db:
+        tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    roster = client.get(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/roster",
+        headers=auth_header("PRF002"),
+    )
+
+    assert roster.status_code == 200
+    student = api_json(roster)["students"][0]
+    assert student["away_seconds"] == 660
+    assert student["away_minutes"] == 11
+    assert student["current_presence_state"] == "away"
+    assert student["status_candidate"] == "late"
+    assert student["monitoring_state"]["away_seconds"] == 660
+
+
+def test_continuous_first_positive_evidence_still_counts_prior_elapsed_time_as_away() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "OK"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=12, ends_in_minutes=18)
+
+    with SessionLocal() as db:
+        events = tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    assert events
+    with SessionLocal() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        state = db.scalar(
+            select(AttendanceMonitoringState).where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+                AttendanceMonitoringState.student_user_id == student.id,
+            )
+        )
+        assert state is not None
+        assert state.current_presence_state == "present"
+        assert state.last_presence_reason == "OK"
+        assert state.away_seconds == 12 * 60
+        assert state.status_candidate == "late"
+
+
+def test_continuous_tick_preserves_all_registered_students_after_presence_connection_release() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=12, ends_in_minutes=18)
+    with SessionLocal.begin() as db:
+        other_student = db.scalar(select(User).where(User.student_id == "20201240"))
+        assert other_student is not None
+        db.add(
+            RegisteredDevice(
+                user_id=other_student.id,
+                label="Kim Other Phone",
+                mac_address="52:54:00:12:34:57",
+                status="active",
+            )
+        )
+
+    with SessionLocal() as db:
+        tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(User.student_id, AttendanceMonitoringState.away_seconds)
+            .join(AttendanceMonitoringState, AttendanceMonitoringState.student_user_id == User.id)
+            .where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+            )
+            .order_by(User.student_id.asc())
+        ).all()
+    assert rows == [("20201239", 660), ("20201240", 660)]
+
+
+def test_continuous_tick_auto_expires_and_materializes_records_after_session_end() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=20, ends_in_minutes=-1)
+
+    with SessionLocal() as db:
+        events = tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    assert [event["event_type"] for event in events] == ["attendance.continuous.updated", "session.expired"]
+    with SessionLocal() as db:
+        session = db.get(AttendanceSession, session_id)
+        assert session is not None
+        assert session.status == "expired"
+        assert session.expires_at is None
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "absent"
+        assert record.attendance_reason == "강의실 이탈로 인한 결석"
+        state = db.scalar(
+            select(AttendanceMonitoringState).where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+                AttendanceMonitoringState.student_user_id == student.id,
+            )
+        )
+        assert state is not None
+        assert state.finalized_at is not None
+        final_audit = db.scalar(
+            select(AttendanceStatusAuditLog)
+            .where(
+                AttendanceStatusAuditLog.attendance_session_id == session_id,
+                AttendanceStatusAuditLog.student_user_id == student.id,
+                AttendanceStatusAuditLog.change_source == "continuous-monitoring-expire",
+            )
+            .order_by(AttendanceStatusAuditLog.id.desc())
+        )
+        assert final_audit is not None
+        assert final_audit.new_status == "absent"
+
+
+def test_continuous_expiry_preserves_professor_manual_override() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=20, ends_in_minutes=-1)
+
+    override = client.patch(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/students/20201239",
+        headers=auth_header("PRF002"),
+        json={"status": "official", "reason": "교수 인정 출석", "projection_key": projection_key},
+    )
+    assert override.status_code == 200
+
+    with SessionLocal() as db:
+        events = tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    assert [event["event_type"] for event in events] == ["attendance.continuous.updated", "session.expired"]
+    with SessionLocal() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "official"
+        assert record.attendance_reason == "교수 인정 출석"
+        auto_final_audit = db.scalar(
+            select(AttendanceStatusAuditLog)
+            .where(
+                AttendanceStatusAuditLog.attendance_session_id == session_id,
+                AttendanceStatusAuditLog.projection_key == projection_key,
+                AttendanceStatusAuditLog.student_user_id == student.id,
+                AttendanceStatusAuditLog.change_source == "continuous-monitoring-expire",
+            )
+            .order_by(AttendanceStatusAuditLog.id.desc())
+        )
+        assert auto_final_audit is None
+
+
+def test_stale_continuous_expiry_catches_up_unaccounted_time() -> None:
+    client, SessionLocal, _ = make_client()
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=20, ends_in_minutes=-1)
+    slot_start = tick_now - timedelta(minutes=20)
+    slot_end = tick_now - timedelta(minutes=1)
+
+    with SessionLocal.begin() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        db.add(
+            AttendanceMonitoringState(
+                attendance_session_id=session_id,
+                projection_key=projection_key,
+                student_user_id=student.id,
+                slot_start_at=slot_start.time().replace(microsecond=0),
+                slot_end_at=slot_end.time().replace(microsecond=0),
+                last_accounted_until=slot_start + timedelta(seconds=60),
+                away_seconds=0,
+                unknown_seconds_consumed=60,
+                current_presence_state="unknown",
+                last_presence_reason="AP_OFFLINE",
+                status_candidate="present",
+            )
+        )
+
+    with SessionLocal() as db:
+        events = expire_stale_attendance_sessions(db, course_code="CSE116")
+
+    assert [event["event_type"] for event in events] == ["session.expired"]
+    with SessionLocal() as db:
+        session = db.get(AttendanceSession, session_id)
+        assert session is not None
+        assert session.status == "expired"
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        state = db.scalar(
+            select(AttendanceMonitoringState).where(
+                AttendanceMonitoringState.attendance_session_id == session_id,
+                AttendanceMonitoringState.projection_key == projection_key,
+                AttendanceMonitoringState.student_user_id == student.id,
+            )
+        )
+        assert state is not None
+        assert state.away_seconds >= 18 * 60
+        assert state.status_candidate == "absent"
+        assert state.finalized_at is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "absent"
+        assert record.attendance_reason == "강의실 이탈로 인한 결석"
+
+
+def test_continuous_monitoring_models_match_db_contract() -> None:
+    lease_columns = AttendanceMonitoringLease.__table__.c
+    state_columns = AttendanceMonitoringState.__table__.c
+
+    assert "lease_owner" in lease_columns
+    assert "owner_instance_id" not in lease_columns
+    assert [column.name for column in AttendanceMonitoringLease.__table__.primary_key.columns] == ["attendance_session_id"]
+    assert "slot_start_at" in state_columns
+    assert "slot_end_at" in state_columns
+
+
+def test_midnight_wrapped_schedule_produces_24h_slots_and_next_day_continuous_expiry() -> None:
+    client, SessionLocal, _ = make_client()
+    with SessionLocal.begin() as db:
+        professor = db.scalar(select(User).where(User.professor_id == "PRF002"))
+        classroom = db.scalar(select(Classroom).where(Classroom.classroom_code == "B101"))
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert professor is not None
+        assert classroom is not None
+        assert student is not None
+        course = Course(course_code="CSE247", title="Continuous Presence 24/7 Test Course", professor_user_id=professor.id)
+        db.add(course)
+        db.flush()
+        db.add_all(
+            [
+                CourseEnrollment(course_id=course.id, student_user_id=student.id, status="active"),
+                CourseSchedule(course_id=course.id, classroom_id=classroom.id, day_of_week=0, starts_at=time(0, 0), ends_at=time(12, 0)),
+                CourseSchedule(course_id=course.id, classroom_id=classroom.id, day_of_week=0, starts_at=time(12, 0), ends_at=time(0, 0)),
+            ]
+        )
+
+    timeline = client.get(
+        "/api/professors/PRF002/courses/CSE247/attendance/timeline",
+        headers=auth_header("PRF002"),
+    )
+    assert timeline.status_code == 200
+    monday_slots = [
+        slot
+        for week in api_json(timeline)["weeks"]
+        for slot in week["slots"]
+        if slot["session_date"] == "2026-03-09"
+    ]
+    assert len(monday_slots) == 48
+    assert monday_slots[0]["slot_start_at"] == "00:00:00"
+    assert monday_slots[-1]["slot_start_at"] == "23:30:00"
+    assert monday_slots[-1]["slot_end_at"] == "00:00:00"
+
+    open_response = client.post(
+        "/api/professors/PRF002/courses/CSE247/attendance/sessions/batch",
+        headers=auth_header("PRF002"),
+        json={
+            "projection_keys": [monday_slots[-1]["projection_key"]],
+            "mode": "smart",
+            "attendance_policy": "continuous_presence_v1",
+        },
+    )
+    assert open_response.status_code == 200
+    result = api_json(open_response)["results"][0]
+    assert result["success"] is True
+
+    with SessionLocal() as db:
+        session = db.get(AttendanceSession, result["session_id"])
+        assert session is not None
+        assert session.slot_end_at == time(0, 0)
+        assert session.expires_at is not None
+        expires_at = session.expires_at.replace(tzinfo=UTC) if session.expires_at.tzinfo is None else session.expires_at
+        assert expires_at == datetime(2026, 3, 10, 0, 0, tzinfo=UTC)
+
+
+def test_continuous_close_materializes_candidate_records_with_audit_reason() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "AP_OFFLINE"
+    session_id, projection_key = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=12, ends_in_minutes=18)
+    with SessionLocal() as db:
+        tick_continuous_attendance_sessions(db, fake_presence, instance_id="worker-a", now=tick_now)
+
+    close = client.post(
+        f"/api/professors/PRF002/attendance/sessions/{session_id}/close",
+        headers=auth_header("PRF002"),
+    )
+
+    assert close.status_code == 200
+    assert api_json(close)["attendance_policy"] == "continuous_presence_v1"
+    with SessionLocal() as db:
+        student = db.scalar(select(User).where(User.student_id == "20201239"))
+        assert student is not None
+        record = db.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.attendance_session_id == session_id,
+                AttendanceRecord.projection_key == projection_key,
+                AttendanceRecord.student_user_id == student.id,
+            )
+        )
+        assert record is not None
+        assert record.final_status == "late"
+        assert record.attendance_reason == "강의실 이탈로 인한 지각"
+        final_audit = db.scalar(
+            select(AttendanceStatusAuditLog)
+            .where(
+                AttendanceStatusAuditLog.attendance_session_id == session_id,
+                AttendanceStatusAuditLog.student_user_id == student.id,
+                AttendanceStatusAuditLog.change_source == "smart-close-default",
+            )
+            .order_by(AttendanceStatusAuditLog.id.desc())
+        )
+        assert final_audit is not None
+        assert final_audit.new_status == "late"
+        assert final_audit.reason == "강의실 이탈로 인한 지각"
 
 
 
