@@ -126,10 +126,11 @@ def make_client(*, session_class: type[Session] | None = None) -> tuple[TestClie
 def seed_backend_state(session: Session) -> None:
     student = User(student_id="20201239", name="Kim Student 06", role="student", password="devpass123")
     other_student = User(student_id="20201240", name="Kim Student 07", role="student", password="devpass123")
+    qa_professor = User(professor_id="PRF001", name="Park Professor 01", role="professor", password="devpass123")
     professor = User(professor_id="PRF002", name="Lee Professor 02", role="professor", password="devpass123")
     other_professor = User(professor_id="PRF003", name="Park Professor 03", role="professor", password="devpass123")
     admin = User(admin_id="ADM001", name="Choi Admin 01", role="admin", password="devpass123")
-    session.add_all([student, other_student, professor, other_professor, admin])
+    session.add_all([student, other_student, qa_professor, professor, other_professor, admin])
     session.flush()
 
     classroom = Classroom(classroom_code="B101", name="Lab", building="Main", floor_label="1F")
@@ -138,8 +139,9 @@ def seed_backend_state(session: Session) -> None:
     session.flush()
 
     course = Course(course_code="CSE116", title="Capstone Design A", professor_user_id=professor.id)
-    other_course = Course(course_code="CSE999", title="Security Testing", professor_user_id=other_professor.id)
-    session.add_all([course, other_course])
+    qa_course = Course(course_code="CSE999", title="Continuous Presence 24/7 Test Course", professor_user_id=qa_professor.id)
+    other_course = Course(course_code="CSE998", title="Security Testing", professor_user_id=other_professor.id)
+    session.add_all([course, qa_course, other_course])
     session.flush()
 
     session.add_all(
@@ -169,9 +171,21 @@ def seed_backend_state(session: Session) -> None:
         [
             CourseEnrollment(course_id=course.id, student_user_id=student.id, status="active"),
             CourseEnrollment(course_id=course.id, student_user_id=other_student.id, status="active"),
+            CourseEnrollment(course_id=qa_course.id, student_user_id=student.id, status="active"),
+            CourseEnrollment(course_id=qa_course.id, student_user_id=other_student.id, status="active"),
             CourseEnrollment(course_id=other_course.id, student_user_id=other_student.id, status="active"),
             CourseSchedule(course_id=course.id, classroom_id=classroom.id, day_of_week=0, starts_at=time(15, 0), ends_at=time(16, 30)),
             CourseSchedule(course_id=other_course.id, classroom_id=other_classroom.id, day_of_week=0, starts_at=time(15, 0), ends_at=time(16, 30)),
+        ]
+    )
+    session.add_all(
+        [
+            CourseSchedule(course_id=qa_course.id, classroom_id=classroom.id, day_of_week=day, starts_at=time(0, 0), ends_at=time(12, 0))
+            for day in range(7)
+        ]
+        + [
+            CourseSchedule(course_id=qa_course.id, classroom_id=classroom.id, day_of_week=day, starts_at=time(12, 0), ends_at=time(0, 0))
+            for day in range(7)
         ]
     )
 
@@ -1379,10 +1393,49 @@ def test_student_active_sessions_read_is_time_independent() -> None:
     assert api_json(response)["sessions"] == []
 
 
+def test_cse999_auto_opens_current_continuous_session_for_prf001_and_students(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import attendance as attendance_module
+
+    fixed_now = datetime(2026, 6, 11, 2, 5, tzinfo=UTC)
+    monkeypatch.setattr(attendance_module, "_utcnow", lambda: fixed_now)
+
+    client, _, _ = make_client()
+    student_response = client.get(
+        "/api/students/20201239/courses/CSE999/attendance/active-sessions",
+        headers=auth_header("20201239"),
+    )
+    assert student_response.status_code == 200
+    student_payload = api_json(student_response)
+    assert len(student_payload["sessions"]) == 1
+    session = student_payload["sessions"][0]
+    assert session["attendance_policy"] == "continuous_presence_v1"
+    assert session["check_in_policy"] == "disabled_continuous_presence"
+    assert session["can_check_in"] is False
+    assert session["current_presence_state"] == "away"
+    assert session["panel_color"] == "red"
+    assert session["projection_key"].startswith("CSE999:B101:2026-06-11:02:00:00:02:30:00")
+
+    professor_response = client.get(
+        "/api/professors/PRF001/courses/CSE999/attendance/timeline",
+        headers=auth_header("PRF001"),
+    )
+    assert professor_response.status_code == 200
+    timeline = api_json(professor_response)
+    current_slots = [
+        slot
+        for week in timeline["weeks"]
+        for slot in week["slots"]
+        if slot["projection_key"] == session["projection_key"]
+    ]
+    assert current_slots
+    assert current_slots[0]["attendance_policy"] == "continuous_presence_v1"
+    assert current_slots[0]["slot_state"] == "online"
+
+
 def test_student_active_sessions_reject_non_enrolled_course() -> None:
     client, _, _ = make_client()
     response = client.get(
-        "/api/students/20201239/courses/CSE999/attendance/active-sessions",
+        "/api/students/20201239/courses/CSE998/attendance/active-sessions",
         headers=auth_header("20201239"),
     )
     assert response.status_code == 403
@@ -1414,7 +1467,7 @@ def test_professor_timeline_rejects_non_owned_course() -> None:
 
 def test_professor_slot_roster_rejects_non_owned_course() -> None:
     client, _, _ = make_client()
-    projection_key = _first_projection_key_for(client, "PRF003", "CSE999")
+    projection_key = _first_projection_key_for(client, "PRF001", "CSE999")
     response = client.get(
         f"/api/professors/PRF002/courses/CSE999/attendance/slot-roster?projection_key={projection_key}",
         headers=auth_header("PRF002"),
@@ -1425,7 +1478,7 @@ def test_professor_slot_roster_rejects_non_owned_course() -> None:
 
 def test_student_check_in_rejects_session_for_non_enrolled_course() -> None:
     client, _, _ = make_client()
-    session_id, _ = _open_session_for(client, "PRF003", "CSE999", mode="smart")
+    session_id, _ = _open_session_for(client, "PRF003", "CSE998", mode="smart")
     response = client.post(
         f"/api/students/20201239/attendance/sessions/{session_id}/check-in",
         headers=auth_header("20201239"),
@@ -1444,7 +1497,7 @@ def test_websocket_rejects_unauthorized_student_subscription() -> None:
 
 def test_websocket_rejects_non_enrolled_student_subscription() -> None:
     client, _, _ = make_client()
-    with client.websocket_connect("/ws/attendance?token=dev-token:20201239&courseCode=CSE999&view=student") as websocket:
+    with client.websocket_connect("/ws/attendance?token=dev-token:20201239&courseCode=CSE998&view=student") as websocket:
         with pytest.raises(WebSocketDisconnect):
             websocket.receive_json()
 

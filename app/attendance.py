@@ -51,6 +51,7 @@ CONTINUOUS_DEPENDENCY_UNKNOWN_REASONS = {
     "PRESENCE_SERVICE_UNAVAILABLE",
     "COLLECTOR_REGISTRY_UNAVAILABLE",
 }
+AUTO_CONTINUOUS_COURSE_CODES = {"CSE999"}
 PROFESSOR_ATTENDANCE_CHANGE_SOURCES = {"professor-manual", "professor-slot-exception"}
 ATTENDANCE_RECORD_CHANGE_SOURCES = PROFESSOR_ATTENDANCE_CHANGE_SOURCES | {
     "self-checkin",
@@ -690,6 +691,7 @@ def build_attendance_timeline(db: Session, professor_id: str, course_code: str) 
     professor, course = get_owned_course(db, professor_id, course_code)
     expire_stale_attendance_sessions(db, course_code)
     slots = _projection_slot_rows(db, course, professor)
+    _ensure_auto_continuous_session_for_current_slot(db, course, professor, slots=slots)
     latest_sessions, assignments_by_session = _projection_lookup_by_session(db, course.id)
     counts_by_session, _, _ = _resolved_counts_by_session_for_course(
         db,
@@ -781,6 +783,59 @@ def build_attendance_report(db: Session, professor_id: str, course_code: str) ->
 
 def _projection_slot_lookup(db: Session, course: Course, professor: User) -> dict[str, ProjectionSlot]:
     return {slot.projection_key: slot for slot in _projection_slot_rows(db, course, professor)}
+
+
+def _slot_contains_dt(slot: ProjectionSlot, target: datetime) -> bool:
+    slot_start = datetime.combine(slot.session_date, slot.slot_start_at, tzinfo=UTC)
+    slot_end = datetime.combine(slot.session_date, slot.slot_end_at, tzinfo=UTC)
+    if slot_end <= slot_start:
+        slot_end += timedelta(days=1)
+    return slot_start <= target < slot_end
+
+
+def _ensure_auto_continuous_session_for_current_slot(
+    db: Session,
+    course: Course,
+    professor: User,
+    *,
+    slots: list[ProjectionSlot] | None = None,
+    now: datetime | None = None,
+) -> None:
+    if course.course_code not in AUTO_CONTINUOUS_COURSE_CODES or not professor.professor_id:
+        return
+    current_now = _coerce_utc(now) or _utcnow()
+    projection_slots = slots if slots is not None else _projection_slot_rows(db, course, professor)
+    current_slot = next((slot for slot in projection_slots if _slot_contains_dt(slot, current_now)), None)
+    if current_slot is None:
+        return
+    active_existing = db.scalar(
+        select(AttendanceSession)
+        .outerjoin(AttendanceSessionSlot, AttendanceSessionSlot.attendance_session_id == AttendanceSession.id)
+        .where(
+            AttendanceSession.status == "active",
+            or_(
+                AttendanceSession.projection_key == current_slot.projection_key,
+                AttendanceSessionSlot.projection_key == current_slot.projection_key,
+            ),
+        )
+        .order_by(desc(AttendanceSession.opened_at), desc(AttendanceSession.id))
+    )
+    if active_existing is not None and _is_continuous_session(active_existing):
+        return
+    if active_existing is not None:
+        active_existing.status = "closed"
+        active_existing.closed_at = current_now
+        active_existing.expires_at = None
+        active_existing.latest_version += 1
+        db.flush()
+    open_attendance_sessions_batch(
+        db,
+        professor.professor_id,
+        course.course_code,
+        projection_keys=[current_slot.projection_key],
+        mode="smart",
+        attendance_policy=ATTENDANCE_POLICY_CONTINUOUS,
+    )
 
 
 
@@ -1202,8 +1257,13 @@ def _continuous_panel_payload(
     now: datetime,
     assignment: SessionSlotAssignment,
 ) -> dict[str, Any]:
+    payload = _continuous_state_payload(state)
+    slot_start = _slot_start_dt(assignment)
+    slot_end = _slot_end_dt(assignment)
+    if state is None and slot_start <= now < slot_end:
+        payload["current_presence_state"] = "away"
     return {
-        **_continuous_state_payload(state),
+        **payload,
         "panel_color": _continuous_panel_color(
             state,
             now=now,
@@ -2323,7 +2383,9 @@ def list_student_active_attendance_sessions(
     ensure_student_enrolled(db, student.id, course.id, student_id, course_code)
     expire_stale_attendance_sessions(db, course_code)
     professor = db.scalar(select(User).where(User.id == course.professor_user_id)) or User(name="담당 교수", role="professor", password="", professor_id="")
-    slot_map = _projection_slot_lookup(db, course, professor)
+    slots = _projection_slot_rows(db, course, professor)
+    _ensure_auto_continuous_session_for_current_slot(db, course, professor, slots=slots)
+    slot_map = {slot.projection_key: slot for slot in slots}
     sessions = db.scalars(
         select(AttendanceSession)
         .where(
