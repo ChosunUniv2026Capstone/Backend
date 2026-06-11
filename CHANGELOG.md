@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.8.0...v0.8.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **backend:** auto-open cse999 current slot ([2b71f7f](https://github.com/ChosunUniv2026Capstone/Backend/commit/2b71f7f1ea28e2b9d504a6eed15c922a43bda6c3))
+
 ## [0.8.0](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.7.0...v0.8.0) (2026-06-10)
 
 
