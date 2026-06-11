@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.8.1...v0.8.2) (2026-06-11)
+
+
+### Bug Fixes
+
+* **backend:** run demo web server with four workers ([#56](https://github.com/ChosunUniv2026Capstone/Backend/issues/56)) ([4a162bd](https://github.com/ChosunUniv2026Capstone/Backend/commit/4a162bd19ad2444b8a33382f39593d741c508371))
+
 ## [0.8.1](https://github.com/ChosunUniv2026Capstone/Backend/compare/v0.8.0...v0.8.1) (2026-06-11)
 
 
