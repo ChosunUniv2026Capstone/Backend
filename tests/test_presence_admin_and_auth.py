@@ -85,12 +85,14 @@ class FakePresenceClient:
         purpose: str,
         classroom_networks: list[dict],
         registered_devices: list[dict],
+        source: str = "auto",
     ):
         self.last_eligibility_payload = {
             "student_id": student_id,
             "course_id": course_id,
             "classroom_id": classroom_id,
             "purpose": purpose,
+            "source": source,
             "classroom_networks": classroom_networks,
             "registered_devices": registered_devices,
         }
@@ -1089,11 +1091,13 @@ def test_attendance_eligibility_normalizes_registry_unavailable_reason() -> None
     assert payload["evidence"]["upstreamCode"] == "COLLECTOR_REGISTRY_UNAVAILABLE"
 
 
-def test_exam_presence_eligibility_persists_log() -> None:
-    client, _ = make_client()
+def test_exam_presence_eligibility_persists_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, fake_presence = make_client()
     from app.services import check_attendance_eligibility
     from app.db import get_db as backend_get_db
     from app.main import app as backend_app, presence_client
+
+    monkeypatch.setattr(services_module.settings, "presence_eligibility_source", "demo")
 
     override = backend_app.dependency_overrides[backend_get_db]
     db = next(override())
@@ -1107,9 +1111,10 @@ def test_exam_presence_eligibility_persists_log() -> None:
             purpose="exam",
         )
         assert result["eligible"] is True
+        assert fake_presence.last_eligibility_payload["source"] == "demo"
         log = db.scalar(select(PresenceEligibilityLog).where(PresenceEligibilityLog.purpose == "exam"))
         assert log is not None
         assert log.reason_code == "OK"
-        assert log.evidence["mode"] == "registered-device-only"
+        assert log.evidence["matchedApIds"] == ["phy3-ap0"]
     finally:
         db.close()

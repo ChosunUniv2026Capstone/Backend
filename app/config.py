@@ -1,6 +1,7 @@
 from functools import lru_cache
 import os
 import socket
+from typing import Literal
 import uuid
 
 from pydantic import Field
@@ -21,6 +22,7 @@ class Settings(BaseSettings):
     db_pool_recycle: int = 1800
     db_pool_pre_ping: bool = True
     presence_service_url: str = "http://presence-service:8001"
+    presence_eligibility_source: Literal["auto", "demo"] = "auto"
     attendance_monitoring_worker_enabled: bool = True
     attendance_monitoring_worker_interval_seconds: float = 10.0
     attendance_monitoring_lease_seconds: int = 30

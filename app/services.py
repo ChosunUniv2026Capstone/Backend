@@ -2386,34 +2386,7 @@ def check_attendance_eligibility(
         )
         return result
 
-    # Exams keep the registered-device gate but do not depend on the current class window.
-    if purpose == "exam":
-        result = {
-            "eligible": True,
-            "reason_code": "OK",
-            "matched_device_mac": registered_devices[0]["mac"],
-            "observed_at": None,
-            "snapshot_age_seconds": None,
-            "evidence": {
-                "mode": "registered-device-only",
-                "registered_device_count": len(registered_devices),
-            },
-        }
-        persist_presence_eligibility_log(
-            db=db,
-            student_id=student_id,
-            course_id=course_id,
-            classroom_code=classroom_id,
-            purpose=purpose,
-            result=result,
-        )
-        return result
-
     try:
-        # The generic student proximity check is not an attendance self check-in.
-        # It must use the selected course's classroom mapping even outside the
-        # current lecture time window; actual attendance submission remains
-        # gated by the attendance session flow.
         resolved_classroom_id = resolve_mapped_classroom_for_course(db, course_id)
     except HTTPException as exc:
         result = {
@@ -2455,6 +2428,7 @@ def check_attendance_eligibility(
             purpose=purpose,
             classroom_networks=classroom_networks,
             registered_devices=registered_devices,
+            source=settings.presence_eligibility_source,
         )
     except HTTPException as exc:
         if not is_presence_dependency_unavailable(exc):
