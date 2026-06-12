@@ -475,6 +475,7 @@ async def _continuous_attendance_monitoring_loop() -> None:
                     presence_client,
                     instance_id=settings.attendance_monitoring_instance_id,
                     lease_seconds=settings.attendance_monitoring_lease_seconds,
+                    presence_source=settings.presence_eligibility_source,
                 )
             for event in events:
                 await attendance_broker.publish(

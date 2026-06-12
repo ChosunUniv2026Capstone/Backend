@@ -10,7 +10,7 @@ from sqlalchemy import Select, desc, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session
 
-from app.config import default_attendance_monitoring_instance_id
+from app.config import default_attendance_monitoring_instance_id, get_settings
 from app.models import (
     AttendanceMonitoringLease,
     AttendanceMonitoringState,
@@ -40,6 +40,7 @@ ATTENDANCE_POLICY_MANUAL = "manual_v1"
 ATTENDANCE_POLICY_SMART_WINDOW = "smart_window_v1"
 ATTENDANCE_POLICY_CONTINUOUS = "continuous_presence_v1"
 SMART_ATTENDANCE_POLICIES = {ATTENDANCE_POLICY_SMART_WINDOW, ATTENDANCE_POLICY_CONTINUOUS}
+PresenceEligibilitySource = Literal["auto", "demo"]
 CONTINUOUS_TICK_SECONDS = 10
 CONTINUOUS_UNKNOWN_GRACE_SECONDS = 60
 CONTINUOUS_LATE_SECONDS = 10 * 60
@@ -1461,6 +1462,7 @@ def tick_continuous_attendance_sessions(
     now: datetime | None = None,
     lease_seconds: int = 30,
     course_code: str | None = None,
+    presence_source: PresenceEligibilitySource = "auto",
 ) -> list[dict[str, Any]]:
     """Run one lease-protected continuous attendance tick."""
 
@@ -1522,6 +1524,7 @@ def tick_continuous_attendance_sessions(
                     _registered_devices_payload(db, student),
                     persist_log=False,
                     release_connection_before_check=True,
+                    presence_source=presence_source,
                 )
                 eligibility_results.append((assignment, student_user_id, eligibility))
             if lease_lost:
@@ -2312,6 +2315,7 @@ def _presence_eligibility_for_assignment(
     registered_devices: list[dict[str, str]],
     persist_log: bool = False,
     release_connection_before_check: bool = True,
+    presence_source: PresenceEligibilitySource | None = None,
 ) -> dict[str, Any]:
     classroom = db.scalar(select(Classroom).where(Classroom.id == assignment.classroom_id))
     student_login_id = student.student_id or ""
@@ -2342,6 +2346,7 @@ def _presence_eligibility_for_assignment(
         # connection before waiting on PresenceService so dashboard/student
         # polling cannot exhaust the backend pool during AP outages.
         db.rollback()
+    effective_presence_source = presence_source or get_settings().presence_eligibility_source
     try:
         payload = presence_client.check_eligibility(
             student_id=student_login_id,
@@ -2350,6 +2355,7 @@ def _presence_eligibility_for_assignment(
             purpose="attendance",
             classroom_networks=classroom_networks,
             registered_devices=registered_devices,
+            source=effective_presence_source,
         )
     except HTTPException as exc:
         if not is_presence_dependency_unavailable(exc):

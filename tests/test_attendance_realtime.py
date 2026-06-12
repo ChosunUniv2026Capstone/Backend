@@ -3,6 +3,7 @@ from envelope import api_json
 
 from collections.abc import Generator
 from datetime import UTC, datetime, time, timedelta
+from types import SimpleNamespace
 import time as monotonic_time
 import pytest
 from fastapi import HTTPException
@@ -49,6 +50,7 @@ class FakePresenceClient:
         purpose: str,
         classroom_networks: list[dict],
         registered_devices: list[dict],
+        source: str = "auto",
     ) -> dict:
         self.calls.append(
             {
@@ -56,6 +58,7 @@ class FakePresenceClient:
                 "course_id": course_id,
                 "classroom_id": classroom_id,
                 "purpose": purpose,
+                "source": source,
             }
         )
         if self.next_exception is not None:
@@ -795,6 +798,29 @@ def test_student_check_in_is_idempotent_and_updates_report() -> None:
     assert api_json(report)["present"] == 1
 
 
+def test_student_active_sessions_use_demo_presence_source_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import attendance as attendance_module
+
+    monkeypatch.setattr(
+        attendance_module,
+        "get_settings",
+        lambda: SimpleNamespace(presence_eligibility_source="demo"),
+        raising=False,
+    )
+    client, _, fake_presence = make_client()
+    _open_session(client, mode="smart")
+    fake_presence.calls.clear()
+
+    response = client.get(
+        "/api/students/20201239/courses/CSE116/attendance/active-sessions",
+        headers=auth_header("20201239"),
+    )
+
+    assert response.status_code == 200
+    assert fake_presence.calls
+    assert {call["source"] for call in fake_presence.calls} == {"demo"}
+
+
 def test_continuous_session_disables_check_in_and_exposes_status_panel() -> None:
     client, SessionLocal, fake_presence = make_client()
     session_id, _ = _open_continuous_session(client)
@@ -939,6 +965,25 @@ def test_continuous_first_positive_evidence_still_counts_prior_elapsed_time_as_a
         assert state.last_presence_reason == "OK"
         assert state.away_seconds == 12 * 60
         assert state.status_candidate == "late"
+
+
+def test_continuous_tick_forwards_demo_presence_source() -> None:
+    client, SessionLocal, fake_presence = make_client()
+    fake_presence.reason_code = "OK"
+    session_id, _ = _open_continuous_session(client)
+    tick_now = _move_session_window(SessionLocal, session_id, started_minutes_ago=12, ends_in_minutes=18)
+
+    with SessionLocal() as db:
+        tick_continuous_attendance_sessions(
+            db,
+            fake_presence,
+            instance_id="worker-a",
+            now=tick_now,
+            presence_source="demo",
+        )
+
+    assert fake_presence.calls
+    assert {call["source"] for call in fake_presence.calls} == {"demo"}
 
 
 def test_continuous_tick_preserves_all_registered_students_after_presence_connection_release() -> None:

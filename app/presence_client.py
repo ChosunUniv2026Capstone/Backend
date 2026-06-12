@@ -99,6 +99,7 @@ class PresenceClient:
         purpose: str,
         classroom_networks: list[dict[str, Any]],
         registered_devices: list[dict[str, str]],
+        source: str = "auto",
     ) -> dict[str, Any]:
         try:
             response = httpx.post(
@@ -108,6 +109,7 @@ class PresenceClient:
                     "courseId": course_id,
                     "classroomId": classroom_id,
                     "purpose": purpose,
+                    "source": source,
                     "classroomNetworks": classroom_networks,
                     "registeredDevices": registered_devices,
                 },
